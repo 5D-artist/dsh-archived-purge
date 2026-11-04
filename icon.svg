@@ -1,0 +1,7 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" width="64" height="64" role="img" aria-label="Archived session cleanup">
+  <rect x="2" y="2" width="60" height="60" rx="14" fill="#4D6BFE"/>
+  <rect x="15" y="16" width="34" height="8" rx="2.5" fill="#FFFFFF"/>
+  <path d="M18.5 26.5h27v18.5a4 4 0 0 1-4 4h-19a4 4 0 0 1-4-4V26.5Z" fill="#FFFFFF"/>
+  <rect x="24" y="31.5" width="16" height="3.4" rx="1.7" fill="#4D6BFE"/>
+  <rect x="24" y="37.5" width="10" height="3.4" rx="1.7" fill="#4D6BFE"/>
+</svg>

@@ -1,0 +1,60 @@
+{
+  "name": "dsh-archived-purge",
+  "version": "1.0.0",
+  "type": "module",
+  "description": "Select-all cleanup for archived DeepSeek Harness sessions: permanently delete the session log, projection cache, workspace accounting and archive marker together.",
+  "keywords": [
+    "dsh",
+    "dsh-plugin",
+    "deepseek-harness",
+    "archive",
+    "session",
+    "cleanup",
+    "storage"
+  ],
+  "license": "MIT",
+  "author": "5D-artist",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/5D-artist/dsh-archived-purge.git"
+  },
+  "homepage": "https://github.com/5D-artist/dsh-archived-purge#readme",
+  "bugs": {
+    "url": "https://github.com/5D-artist/dsh-archived-purge/issues"
+  },
+  "engines": {
+    "dsh": ">=0.2.1-rc.0"
+  },
+  "scripts": {
+    "test": "node --test test/host.test.mjs"
+  },
+  "exports": {
+    ".": "./index.js",
+    "./client": "./client.js",
+    "./locale/*.json": "./locale/*.json",
+    "./icon": "./icon.svg"
+  },
+  "files": [
+    "index.js",
+    "client.js",
+    "cordis.patch.yml",
+    "locale/*.json",
+    "icon.svg",
+    "assets/*",
+    "README.md",
+    "LICENSE"
+  ],
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    },
+    "client": {
+      "platform": "web",
+      "immediately": true,
+      "inject": [
+        "@deepseek-ai/dsh-client-locale",
+        "@deepseek-ai/dsh-client-ui-settings"
+      ]
+    }
+  }
+}

@@ -1,0 +1,6 @@
+{
+  "meta": {
+    "title": "Archive Cleanup",
+    "description": "Select and permanently delete archived sessions together with their session log, projection cache, workspace accounting, and archive marker."
+  }
+}

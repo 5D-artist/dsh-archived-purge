@@ -1,0 +1,4 @@
+# Insert the archived-session cleanup page into this profile.
+- insert:
+    - id: archived-purge
+      name: 'dsh-archived-purge'
