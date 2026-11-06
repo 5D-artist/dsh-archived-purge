@@ -47,15 +47,43 @@ async function writeRegistry(home, archived, sessionIds) {
   }, null, 2));
 }
 
-function makeRegistry(sessionIds) {
+/**
+ * A registry stub that persists like the real one: `detachSession` drops the
+ * slot from `tables.workspaces.w1.sessionIds`, `unarchiveSession` drops the id
+ * from `global.archivedSessionIds`, both written back to workspace.json. Tests
+ * can therefore assert the durable end state rather than only the calls.
+ */
+function makeRegistry(home, sessionIds) {
   const detached = [];
   const unarchived = [];
+  async function rewrite(change) {
+    const file = path.join(home, 'storages', 'workspace.json');
+    const doc = JSON.parse(await fsp.readFile(file, 'utf8'));
+    change(doc);
+    await fsp.writeFile(file, JSON.stringify(doc, null, 2));
+  }
   return {
     detached,
     unarchived,
     registry: {
-      list: () => [{ id: 'w1', title: 'demo-workspace', sessionIds: [...sessionIds], detachSession: async (id) => { detached.push(id); } }],
-      unarchiveSession: async (id) => { unarchived.push(id); },
+      list: () => [{
+        id: 'w1',
+        title: 'demo-workspace',
+        sessionIds: [...sessionIds],
+        detachSession: async (id) => {
+          detached.push(id);
+          await rewrite((doc) => {
+            const record = doc.tables.workspaces.w1;
+            if (record) record.sessionIds = record.sessionIds.filter((value) => value !== id);
+          });
+        },
+      }],
+      unarchiveSession: async (id) => {
+        unarchived.push(id);
+        await rewrite((doc) => {
+          doc.global.archivedSessionIds = doc.global.archivedSessionIds.filter((value) => value !== id);
+        });
+      },
     },
   };
 }
@@ -75,7 +103,7 @@ test('reads archived ids and groups sessions by workspace', async () => {
     home,
     sessions: { get: () => undefined },
     agents: undefined,
-    workspaceRegistry: makeRegistry(['session-alpha', 'session-beta']).registry,
+    workspaceRegistry: makeRegistry(home, ['session-alpha', 'session-beta']).registry,
     sessionPersistence: undefined,
   });
   const data = await handlers.state();
@@ -97,7 +125,7 @@ test('delete removes log, cache, accounting and archive marker', async () => {
   await makeCache(cache, 'session-beta', 'Beta');
   await writeRegistry(home, ['session-alpha', 'session-beta'], ['session-alpha', 'session-beta']);
 
-  const { registry, detached, unarchived } = makeRegistry(['session-alpha', 'session-beta']);
+  const { registry, detached, unarchived } = makeRegistry(home, ['session-alpha', 'session-beta']);
   const handlers = createHandlers({
     home,
     sessions: { get: () => undefined },
@@ -117,7 +145,8 @@ test('delete removes log, cache, accounting and archive marker', async () => {
   assert.deepEqual(unarchived, ['session-alpha']);
 
   const after = await readArchivedState(home);
-  assert.deepEqual(after.archived, ['session-alpha', 'session-beta'], 'host never rewrites workspace.json directly');
+  assert.deepEqual(after.archived, ['session-beta'], 'the archive marker moves only through the registry API');
+  assert.deepEqual(after.workspaces.w1.sessionIds, ['session-beta'], 'the accounting slot moves only through the entity API');
 });
 
 test('refuses a Session that still reports work and leaves its files alone', async () => {
@@ -130,7 +159,7 @@ test('refuses a Session that still reports work and leaves its files alone', asy
     home,
     sessions: { get: () => undefined },
     activity: async (id) => (id === 'session-alpha' ? [{ kind: 'turn' }] : []),
-    workspaceRegistry: makeRegistry(['session-alpha']).registry,
+    workspaceRegistry: makeRegistry(home, ['session-alpha']).registry,
     sessionPersistence: undefined,
   });
   const result = await handlers.remove(['session-alpha']);
@@ -151,10 +180,11 @@ test('deletes an archived Session that is resident but idle (regression)', async
   await makeCache(cache, 'session-alpha', 'Alpha');
   await writeRegistry(home, ['session-alpha'], ['session-alpha']);
 
-  const { registry, detached, unarchived } = makeRegistry(['session-alpha']);
+  const { registry, detached, unarchived } = makeRegistry(home, ['session-alpha']);
+  const sessions = { get: (id) => (id === 'session-alpha' ? { id } : undefined) };
   const handlers = createHandlers({
     home,
-    sessions: { get: (id) => (id === 'session-alpha' ? { id } : undefined) },
+    sessions,
     activity: async () => [],
     workspaceRegistry: registry,
     sessionPersistence: undefined,
@@ -167,9 +197,25 @@ test('deletes an archived Session that is resident but idle (regression)', async
   const result = await handlers.remove(['session-alpha']);
   assert.equal(result.ok, true);
   assert.equal(result.deleted, 1);
+  assert.deepEqual(result.deferred, ['session-alpha'], 'bookkeeping waits for the Session to leave the store');
   await assert.rejects(fsp.stat(alphaDir));
+  await assert.rejects(fsp.stat(path.join(cache, 'session-alpha.json')));
+  // The slot and the archive marker stay: dropping them here would list the
+  // still-listed Session under the sidebar's ungrouped bucket.
+  assert.deepEqual(detached, []);
+  assert.deepEqual(unarchived, []);
+  assert.deepEqual((await readArchivedState(home)).archived, ['session-alpha']);
+  const after = await handlers.state();
+  assert.equal(after.items.length, 0, 'a finished row is not listed again');
+  assert.equal(after.pendingFinalize, 1);
+
+  // Restart: nothing holds the Session any more, so loading finishes the job.
+  sessions.get = () => undefined;
+  const finalized = await handlers.finalizePending();
+  assert.deepEqual(finalized, ['session-alpha']);
   assert.deepEqual(detached, ['session-alpha']);
   assert.deepEqual(unarchived, ['session-alpha']);
+  assert.deepEqual((await readArchivedState(home)).archived, []);
 });
 
 test('refuses the whole batch when one Session still reports work', async () => {
@@ -180,7 +226,7 @@ test('refuses the whole batch when one Session still reports work', async () => 
   await makeCache(cache, 'session-beta', 'Beta');
   await writeRegistry(home, ['session-alpha', 'session-beta'], ['session-alpha', 'session-beta']);
 
-  const { registry, detached, unarchived } = makeRegistry(['session-alpha', 'session-beta']);
+  const { registry, detached, unarchived } = makeRegistry(home, ['session-alpha', 'session-beta']);
   const handlers = createHandlers({
     home,
     sessions: { get: () => undefined },
@@ -208,7 +254,7 @@ test('refuses the batch when the activity probe itself fails', async () => {
     home,
     sessions: { get: () => undefined },
     activity: async () => { throw new Error('waterfall exploded'); },
-    workspaceRegistry: makeRegistry(['session-alpha']).registry,
+    workspaceRegistry: makeRegistry(home, ['session-alpha']).registry,
     sessionPersistence: undefined,
   });
   const result = await handlers.remove(['session-alpha']);
@@ -225,7 +271,7 @@ test('marks an unknown activity state in the listing instead of calling it runni
     home,
     sessions: { get: () => ({ id: 'session-alpha' }) },
     activity: async () => { throw new Error('no probe'); },
-    workspaceRegistry: makeRegistry(['session-alpha']).registry,
+    workspaceRegistry: makeRegistry(home, ['session-alpha']).registry,
     sessionPersistence: undefined,
   });
   const state = await handlers.state();
@@ -241,7 +287,7 @@ test('rejects malformed ids and non-archived ids', async () => {
   const handlers = createHandlers({
     home,
     sessions: { get: () => undefined },
-    workspaceRegistry: makeRegistry(['session-alpha']).registry,
+    workspaceRegistry: makeRegistry(home, ['session-alpha']).registry,
     sessionPersistence: undefined,
   });
 
@@ -262,7 +308,7 @@ test('uses the durable accounting slot even when the projection dropped the id',
   await makeCache(cache, 'session-alpha', 'Alpha');
   await writeRegistry(home, ['session-alpha'], ['session-alpha']);
 
-  const { registry, detached, unarchived } = makeRegistry([]);
+  const { registry, detached, unarchived } = makeRegistry(home, []);
   const handlers = createHandlers({
     home,
     sessions: { get: () => undefined },
@@ -292,7 +338,7 @@ test('cascades archived parents into subagent-origin descendants only', async ()
   const handlers = createHandlers({
     home,
     sessions: { get: () => undefined },
-    workspaceRegistry: makeRegistry(['session-parent']).registry,
+    workspaceRegistry: makeRegistry(home, ['session-parent']).registry,
     sessionPersistence: { list: async () => snapshots },
   });
 

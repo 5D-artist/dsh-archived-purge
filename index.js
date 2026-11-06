@@ -227,10 +227,18 @@ export function createHandlers(deps) {
     const { archived, workspaces } = await readArchivedState(home);
     const dirs = await scanSessionDirs(sessionsRoot);
     const items = [];
+    let pendingFinalize = 0;
     for (const id of archived) {
       if (!ID_RE.test(id)) continue;
-      const cacheDoc = await readCacheDoc(cacheRoot, id);
       const sessionDirs = dirs.get(id) ?? [];
+      if (sessionDirs.length === 0) {
+        // No log left: the entry is only bookkeeping, either from a delete that
+        // ran while the Session was resident or from a log removed by hand.
+        // finalizePending() clears it; listing it would show a 0-byte ghost.
+        pendingFinalize += 1;
+        continue;
+      }
+      const cacheDoc = await readCacheDoc(cacheRoot, id);
       let bytes = 0;
       let lastActivity = 0;
       for (const dir of sessionDirs) {
@@ -277,6 +285,7 @@ export function createHandlers(deps) {
     return {
       items,
       archivedCount: items.length,
+      pendingFinalize,
       totalBytes: items.reduce((sum, item) => sum + item.sizeBytes, 0),
       generatedAt: Date.now(),
     };
@@ -357,6 +366,13 @@ export function createHandlers(deps) {
       return { id, ok: false, code: 'delete-failed', message: failures.join('; '), removedBytes };
     }
     if (!options?.cascade) {
+      // A plugin cannot evict a resident Session from `ctx.sessions`: archiving
+      // never disposes it, and the AgentHandle disposer belongs to its creator.
+      // Dropping the workspace slot while the Session is still listed would
+      // surface it under the sidebar's "未分组" bucket until the process exits,
+      // so the slot and the archive marker are kept and `finalizePending()`
+      // completes them once the Session is no longer resident (next start).
+      if (isResident(id)) return { id, ok: true, removedBytes, deferred: true };
       const workspaceId = rawOwner(workspaces, id);
       if (workspaceId) {
         const owner = wsEntity(workspaceId);
@@ -401,6 +417,49 @@ export function createHandlers(deps) {
     return undefined;
   }
 
+  /**
+   * Clear the bookkeeping a delete had to leave behind because the Session was
+   * still resident: its workspace slot and its archive marker. Runs when the
+   * plugin loads and before every batch, so a deferred delete finishes as soon
+   * as the Session is out of the store (i.e. on the next start) instead of
+   * leaving a ghost in the sidebar or in this list.
+   * @returns {Promise<string[]>} the ids that were finalized.
+   */
+  async function finalizePending() {
+    const { archived, workspaces } = await readArchivedState(home);
+    if (archived.length === 0) return [];
+    const dirs = await scanSessionDirs(sessionsRoot);
+    const done = [];
+    for (const id of archived) {
+      if (!ID_RE.test(id)) continue;
+      if ((dirs.get(id) ?? []).length > 0) continue;
+      if (isResident(id)) continue;
+      const workspaceId = rawOwner(workspaces, id);
+      if (workspaceId) {
+        const owner = wsEntity(workspaceId);
+        if (owner) {
+          try {
+            await owner.detachSession(id);
+          } catch {
+            continue;
+          }
+        }
+      }
+      try {
+        await workspaceRegistry.unarchiveSession(id);
+        done.push(id);
+      } catch {
+        /* retried on the next load */
+      }
+      try {
+        await fsp.rm(path.join(cacheRoot, `${id}.json`), { force: true });
+      } catch {
+        /* a leftover cache row is disposable */
+      }
+    }
+    return done;
+  }
+
   async function remove(requested) {
     if (!Array.isArray(requested) || requested.length === 0) {
       return { ok: false, code: 'invalid-request', message: 'sessionIds 不能为空' };
@@ -415,6 +474,8 @@ export function createHandlers(deps) {
       }
       if (!ids.includes(value)) ids.push(value);
     }
+    // Heal markers left by an earlier delete whose target was still resident.
+    const finalized = await finalizePending();
     const { archived, workspaces } = await readArchivedState(home);
     const archivedSet = new Set(archived);
     const notArchived = ids.filter((id) => !archivedSet.has(id));
@@ -473,15 +534,19 @@ export function createHandlers(deps) {
     }
     const deleted = results.filter((item) => item.ok);
     const failed = results.filter((item) => !item.ok);
+    const deferred = results.filter((item) => item.ok && item.deferred).map((item) => item.id);
     const ok = failed.length === 0;
+    const deferredNote = deferred.length > 0 ? `（其中 ${deferred.length} 个的记账待重启后回收）` : '';
     return {
       ok,
       code: ok ? undefined : 'delete-failed',
       message: ok
-        ? `已删除 ${deleted.length} 个会话`
+        ? `已删除 ${deleted.length} 个会话${deferredNote}`
         : `${failed.length} 个会话删除失败：${failed[0].message ?? failed[0].code ?? '未知错误'}`,
       deleted: deleted.length,
       failed: failed.length,
+      deferred,
+      finalized,
       removedBytes: results.reduce((sum, item) => sum + (item.removedBytes ?? 0), 0),
       results,
       archivedCount: archived.length,
@@ -489,7 +554,7 @@ export function createHandlers(deps) {
     };
   }
 
-  return { state, remove, sessionsRoot, cacheRoot };
+  return { state, remove, finalizePending, sessionsRoot, cacheRoot };
 }
 
 function readBody(req) {
@@ -546,6 +611,14 @@ export function apply(ctx) {
     activity,
     workspaceRegistry: ctx.workspaceRegistry,
     sessionPersistence: ctx.sessionPersistence,
+  });
+
+  // A delete that ran against a resident Session leaves its bookkeeping behind
+  // on purpose; once the process no longer holds that Session, finish it.
+  void handlers.finalizePending().then((ids) => {
+    if (ids.length > 0) ctx.logger?.info?.(`archived-purge: finalized ${ids.length} deleted session(s)`);
+  }).catch((error) => {
+    ctx.logger?.warn?.(`archived-purge: finalizing deleted sessions failed: ${formatError(error)}`);
   });
 
   ctx.effect(() => ctx.webServer.register({

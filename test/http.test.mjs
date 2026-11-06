@@ -41,11 +41,32 @@ function makeCtx(home, activity) {
   const routes = new Map();
   const detached = [];
   const unarchived = [];
+  async function rewrite(change) {
+    const file = path.join(home, 'storages', 'workspace.json');
+    const doc = JSON.parse(await fsp.readFile(file, 'utf8'));
+    change(doc);
+    await fsp.writeFile(file, JSON.stringify(doc, null, 2));
+  }
   const ctx = {
     sessions: { get: (id) => (id === 'session-alpha' ? { id } : undefined) },
     workspaceRegistry: {
-      list: () => [{ id: 'w1', sessionIds: ['session-alpha'], detachSession: async (id) => { detached.push(id); } }],
-      unarchiveSession: async (id) => { unarchived.push(id); },
+      list: () => [{
+        id: 'w1',
+        sessionIds: ['session-alpha'],
+        detachSession: async (id) => {
+          detached.push(id);
+          await rewrite((doc) => {
+            const record = doc.tables.workspaces.w1;
+            if (record) record.sessionIds = record.sessionIds.filter((value) => value !== id);
+          });
+        },
+      }],
+      unarchiveSession: async (id) => {
+        unarchived.push(id);
+        await rewrite((doc) => {
+          doc.global.archivedSessionIds = doc.global.archivedSessionIds.filter((value) => value !== id);
+        });
+      },
     },
     sessionPersistence: undefined,
     waterfall: async (name, payload, next) => {
@@ -110,8 +131,27 @@ test('idle archived Session deletes with HTTP 200 even while still resident', as
   assert.equal(payload.ok, true);
   assert.equal(payload.deleted, 1);
   assert.equal(payload.failed, 0);
+  assert.deepEqual(payload.deferred, ['session-alpha'], 'the store still holds it, so bookkeeping waits');
   await assert.rejects(fsp.stat(dir));
   await assert.rejects(fsp.stat(path.join(cache, 'session-alpha.json')));
+  assert.deepEqual(detached, [], 'the slot stays while the Session is still listed');
+  assert.deepEqual(unarchived, []);
+
+  // The page must not offer the finished row again, only say it is pending.
+  const stateRes = makeRes();
+  const stateReq = new EventEmitter();
+  stateReq.method = 'GET';
+  stateReq.headers = { host: '127.0.0.1:10094' };
+  await routes.get('/plugins/archived-purge/state').handler(stateReq, stateRes);
+  const state = JSON.parse(stateRes.body);
+  assert.equal(state.items.length, 0);
+  assert.equal(state.pendingFinalize, 1);
+
+  // Next start: the Session is out of the store, so the next request heals it.
+  ctx.sessions.get = () => undefined;
+  const again = await callDelete(routes, ['session-alpha']);
+  assert.equal(again.status, 200);
+  assert.equal(again.payload.code, 'not-archived');
   assert.deepEqual(detached, ['session-alpha']);
   assert.deepEqual(unarchived, ['session-alpha']);
 });

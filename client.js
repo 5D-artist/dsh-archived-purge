@@ -49,6 +49,8 @@ window.__ModuleLoader__.load({
       noticeDeleted: '已删除',
       noticeFreed: '释放',
       noticeFailed: '删除未完成',
+      pendingFinalizeHint: '另有 {n} 个已删除会话的记账将在下次启动时自动回收',
+      deferredSuffix: '（{n} 个的记账待重启后回收）',
       irreversible: '此操作不可撤销',
       countUnit: '个会话',
     };
@@ -86,6 +88,8 @@ window.__ModuleLoader__.load({
       noticeDeleted: 'Deleted',
       noticeFreed: 'Freed',
       noticeFailed: 'Deletion not completed',
+      pendingFinalizeHint: '{n} deleted Sessions still hold bookkeeping that clears on the next start',
+      deferredSuffix: ' ({n} waiting for the next start)',
       irreversible: 'This action cannot be undone',
       countUnit: 'sessions',
     };
@@ -315,9 +319,11 @@ window.__ModuleLoader__.load({
             // The Host answers 200 for every well-formed request, including one
             // that removed nothing; `ok` and `message` carry the outcome.
             if (result?.ok) {
+              const deferred = result.deferred?.length ?? 0;
               setNotice({
                 kind: 'ok',
-                text: `${t('noticeDeleted')} ${result.deleted ?? ids.length} ${t('countUnit')} · ${t('noticeFreed')} ${formatBytes(result.removedBytes)}`,
+                text: `${t('noticeDeleted')} ${result.deleted ?? ids.length} ${t('countUnit')} · ${t('noticeFreed')} ${formatBytes(result.removedBytes)}`
+                  + (deferred > 0 ? t('deferredSuffix').replace('{n}', String(deferred)) : ''),
               });
               setSelected(new Set());
             } else {
@@ -394,6 +400,9 @@ window.__ModuleLoader__.load({
                 ? h('ul', { className: 'ap-noticelist' }, notice.details.map((line, index) => h('li', { key: index }, line)))
                 : null,
             )
+            : null,
+          (data?.pendingFinalize ?? 0) > 0
+            ? h('div', { className: 'ap-meta' }, t('pendingFinalizeHint').replace('{n}', String(data.pendingFinalize)))
             : null,
           loading
             ? h('div', { className: 'ap-meta' }, '…')

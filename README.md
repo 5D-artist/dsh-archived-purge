@@ -8,7 +8,7 @@ DSH 自带的「归档」只是把会话从侧边栏隐藏，磁盘上的日志�
 
 ## 功能
 
-- **一眼看清**：按工作区分组，显示标题、最后活动时间、占用体积；日志已丢失的会话单独标记。
+- **一眼看清**：按工作区分组，显示标题、最后活动时间、占用体积。
 - **全选 / 多选**：顶部全选，逐行勾选，实时显示已选条数与总体积。
 - **永久删除**：一次清掉四类本地痕迹
   - 会话日志目录 `<DSH_HOME>/sessions/--<cwd>--/<session-id>/`
@@ -50,14 +50,23 @@ https://github.com/5D-artist/dsh-archived-purge
 | 工作区记账 | ✅ | 走 `Workspace.detachSession`，不手改 `workspace.json` |
 | 归档集合 | ✅ | 走 `unarchiveSession`，不手改注册表 |
 | subagent 子会话日志 | ✅ | 仅 `origin: 'subagent'` 的后代 |
-| 附件（`attachments/`） | ❌ | 内容寻址、可能被多个会话共享 |
-| 工作区目录 / 文件 | ❌ | 只删会话存储 |
+| 附件（`attachments/`） | ❌ | 内容寻址、可能被多个会话共享；DSH 上游把「引用感知的 GC」列为未决事项（见下节） |
+| 请求图缩放缓存（`cache/attachments/request-images/`） | ❌ | 由附件派生的可重建文件，随附件一起处理 |
+| 工作区目录 / 文件 | ❌ | 只删会话存储；生成物是用户文件，不属于会话私有缓存 |
 | fork 出来的普通会话 | ❌ | 只按 subagent 血缘级联 |
+
+### 为什么不动附件与工作区文件
+
+- DSH 的附件存储是**内容寻址且不可变**的，`dsh-attachment` 的文档写明：恢复或 fork 出来的会话可能共享同一批对象，因此 **reference-aware GC 被明确推迟，不绑定任何单个会话的删除**；上游现状是「附件永不删除，没有任何机制会自动清理」。
+- 会话日志里只存 `{"type":"image","attachment":{"attachmentId":"sha256:…"}}` 这类引用，**没有「谁创建了它」的字段**；跨会话是否共享只能靠扫描全部日志才知道。按单个会话删附件，会直接破坏其它会话的历史（读历史时图片 404）。
+- 工作区里的文件（生成的文档、封面、视频等）是**用户产出**，同一个文件可能被多个会话引用，也可能被用户继续使用；归档/删除会话时删它们不是「清理缓存」，而是删用户数据。
+- 因此本插件只删**可证明属于该会话**的存储：日志目录、投影缓存行、工作区记账、归档标记。要清附件，得先有引用模型（扫描全部日志 → 只删无人引用的对象），这一步是插件之外的独立动作（见「已知限制」）。
 
 ## 安全设计
 
 - **运行中拒绝，但「在内存里」不等于运行中**：归档只是把会话从侧边栏隐藏，并不会销毁它 —— 最近用过的归档会话仍然驻留在 `ctx.sessions` 里。旧版把「存在」当成「运行中」，于是任何还热着的归档会话都删不掉，页面只显示 `部分删除失败: 0 / 4 · HTTP 400`。现在改为询问 Host 的 `workspace/session-activity` 瀑布（Agent 的 `turn`、任务注册表、子代理运行时、定时任务都会在这里应答，`archiveSession` 用的是同一道闸），只有真的有活要干时才拒绝，并说明是哪一类工作。
 - **整批前置检查**：删除前先一次性检查这一批（含 subagent 后代），只要有一个还在跑就整批不动，不会出现「一半删了、一半留着」的残局。
+- **驻留会话的记账延后回收**：文件可以立刻删（磁盘马上回收），但**不能**在会话还驻留内存时把它从工作区记账里摘掉 —— 那样它仍会被 `sessions.list()` 列出来，只是失去归属，于是掉进侧边栏的「未分组」。所以驻留目标的记账与归档标记会保留到**下次启动**（此时进程不再持有该会话），由 `finalizePending()` 收尾；页面在此期间只显示一行「另有 N 个已删除会话的记账将在下次启动时自动回收」。
 - **入口校验**：`sessionId` 必须匹配 `^[A-Za-z0-9][A-Za-z0-9_-]{0,199}$`；请求必须同源、`application/json`、体大小受限。
 - **路径边界**：待删路径必须 `path.relative` 落在 `sessions/` 或投影缓存根内。
 - **不重写注册表**：归档集合与工作区记账都通过公开 service 方法修改，避免与运行中的注册表写入竞争。
@@ -80,6 +89,12 @@ https://github.com/5D-artist/dsh-archived-purge
 删除接口的状态码约定：`400` 只用于请求体不是合法 JSON，`403` 只用于跨源，`405` / `415` 用于方法与 Content-Type；「没删成」属于业务结果，用 200 + `ok: false` + `message` 表达，页面据此逐条列出原因。
 
 ## 更新日志
+
+### 1.0.2
+
+- 修复 **删除后会话掉进侧边栏「未分组」**：文件删完之后，旧实现立刻摘掉工作区记账并解除归档；但驻留内存的会话仍会被 `sessions.list()` 列出，于是失去归属、以「未分组」重新出现。现在驻留目标的记账与归档标记保留到下次启动，由 `finalizePending()` 收尾（启动时、以及每次删除前都会跑一遍），页面只提示「另有 N 个已删除会话的记账将在下次启动时自动回收」。
+- 列表不再显示「日志缺失」的幽灵行：没有日志的归档条目属于待回收记账，收尾时自动消失。
+- README 补上「为什么不动附件与工作区文件」：上游 `dsh-attachment` 明确把 reference-aware GC 推迟，附件不可变且可能跨会话共享，工作区文件是用户产出。
 
 ### 1.0.1
 
@@ -108,7 +123,8 @@ test/http.test.mjs  路由 / 响应体集成测试
 ## 已知限制
 
 - 只能删除归档集合中的会话；活动会话请先归档。
-- 附件不随会话清理（内容寻址，可能共享）。
+- 附件与 HTTP 请求图缓存不随会话清理：内容是共享的，DSH 没有引用模型；需要一个「扫描全部日志 → 只删无人引用的对象」的独立动作。
+- 驻留会话的记账在下一次启动时回收（DSH 没有让第三方插件把会话逐出 `ctx.sessions` 的公开接口）。
 - 归档时间不是 DSH 的持久字段，列表用最后活动时间排序。
 
 ## License
@@ -125,7 +141,7 @@ DSH's built-in archive only hides a session from the sidebar; its log, projectio
 
 ## Features
 
-- Grouped by workspace with title, last activity and size; rows whose log is already gone are marked.
+- Grouped by workspace with title, last activity and size.
 - Select all or individual rows, with live count and total size.
 - Permanent deletion of the session log directory, the projection-cache row, the workspace accounting slot (`Workspace.detachSession`) and the archive-set entry (`workspaceRegistry.unarchiveSession`).
 - Cascades only `origin: 'subagent'` descendants; ordinary forks are left alone.
@@ -146,13 +162,23 @@ Settings → Archive Cleanup → select all → Delete selected → confirm. Not
 
 ## Safety
 
-Archiving hides a Session without disposing it, so a recently used archived Session stays resident in `ctx.sessions` — presence is not liveness. The purge asks the Host's `workspace/session-activity` waterfall (the same admission check `archiveSession` uses) and refuses only Sessions that still report running work, after a whole-batch pre-flight. Attachments are never touched (content-addressed and possibly shared). The workspace registry is never rewritten by hand; archive and accounting go through public service methods.
+Archiving hides a Session without disposing it, so a recently used archived Session stays resident in `ctx.sessions` — presence is not liveness. The purge asks the Host's `workspace/session-activity` waterfall (the same admission check `archiveSession` uses) and refuses only Sessions that still report running work, after a whole-batch pre-flight.
+
+Deleting the files of a resident Session is fine; dropping its workspace slot while it is still listed is not — that is what made the Session reappear under the sidebar's *Ungrouped* bucket. So a resident target keeps its slot and archive marker until the process no longer holds it, and `finalizePending()` (on load, and before each batch) clears them on the next start. The page says how many entries are waiting.
+
+Attachments and their derived request-image cache are never touched: objects are content-addressed, may be shared by resumed or forked Sessions, and upstream `dsh-attachment` deliberately defers reference-aware GC. Workspace files are user output, not Session storage. The workspace registry is never rewritten by hand; archive and accounting go through public service methods.
 
 ## Compatibility
 
 Tested on DSH 0.2.1-rc.5 (Desktop, Windows). Requires `webServer`, `workspaceRegistry`, `sessions` and `sessionPersistence`; targets the 0.2.x v4 session layout and workspace schema v2.
 
 ## Changelog
+
+### 1.0.2
+
+- Fixed Sessions falling into the sidebar's **Ungrouped** bucket after a delete: bookkeeping and the archive marker now stay until the Session leaves the store, and `finalizePending()` finishes them on the next start (also before every batch). The list reports how many entries are waiting.
+- The list no longer shows ghost rows for archived entries whose log is gone.
+- Documented why attachments and workspace files stay out of scope, with the upstream retention decision.
 
 ### 1.0.1
 
