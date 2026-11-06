@@ -37,7 +37,7 @@ async function makeHome() {
   return { home, dir, cache };
 }
 
-function makeCtx(home, activity) {
+function makeCtx(home, activity, options = {}) {
   const routes = new Map();
   const detached = [];
   const unarchived = [];
@@ -68,7 +68,7 @@ function makeCtx(home, activity) {
         });
       },
     },
-    sessionPersistence: undefined,
+    sessionPersistence: options.persistence,
     waterfall: async (name, payload, next) => {
       assert.equal(name, 'workspace/session-activity');
       return activity(payload.sessionId);
@@ -114,10 +114,56 @@ function makeRes() {
   };
 }
 
-async function callDelete(routes, sessionIds) {
+async function post(routes, routePath, body) {
   const res = makeRes();
-  await routes.get('/plugins/archived-purge/delete').handler(makeReq({ sessionIds }), res);
+  await routes.get(routePath).handler(makeReq(body), res);
   return { status: res.status, payload: res.body ? JSON.parse(res.body) : undefined };
+}
+
+async function callDelete(routes, sessionIds, extra = {}) {
+  return post(routes, '/plugins/archived-purge/delete', { sessionIds, ...extra });
+}
+
+const digest = (fill) => fill.repeat(64).slice(0, 64).toLowerCase();
+
+function fakePersistence(sessions, home) {
+  // A real backend lists only what is still stored, so a deleted log drops out
+  // of the listing (and therefore out of the reference scan).
+  const stored = async (id) => {
+    if (home === undefined) return true;
+    try {
+      await fsp.access(path.join(home, 'sessions', '--C-tmp-proj--', id));
+      return true;
+    } catch {
+      return false;
+    }
+  };
+  return {
+    list: async () => {
+      const out = [];
+      for (const [id, spec] of Object.entries(sessions)) {
+        if (!(await stored(id))) continue;
+        out.push({ header: { id, cwd: spec.cwd, createdAt: 1 } });
+      }
+      return out;
+    },
+    open: async (id) => {
+      const spec = sessions[id];
+      if (!spec || !(await stored(id))) throw new Error(`missing ${id}`);
+      if (spec.unreadable) throw new Error('corrupt log');
+      return { read: async () => ({ eventState: 'detached', events: spec.events }), close: async () => {} };
+    },
+  };
+}
+
+async function writeObject(root, name, bytes) {
+  const shard = path.join(root, name.slice(0, 2));
+  await fsp.mkdir(shard, { recursive: true });
+  const file = path.join(shard, name);
+  await fsp.writeFile(file, Buffer.alloc(bytes, 5));
+  const past = new Date(Date.now() - 3_600_000);
+  await fsp.utimes(file, past, past);
+  return file;
 }
 
 test('idle archived Session deletes with HTTP 200 even while still resident', async () => {
@@ -225,4 +271,104 @@ test('malformed JSON stays a 400 while a rejected id travels as data', async () 
   assert.equal(bad.status, 200);
   assert.equal(bad.payload.ok, false);
   assert.equal(bad.payload.code, 'invalid-request');
+});
+
+test('scan reports what a delete would free, gc removes only unreferenced objects', async () => {
+  const { home } = await makeHome();
+  process.env.DSH_HOME = home;
+  const objectsRoot = path.join(home, 'attachments', 'v1', 'objects');
+  const referenced = digest('a');
+  const orphan = digest('b');
+  await writeObject(objectsRoot, referenced, 128);
+  await writeObject(objectsRoot, orphan, 64);
+
+  const persistence = fakePersistence({
+    'session-alpha': {
+      cwd: 'C:\\tmp\\proj',
+      events: [{ type: 'user/message', data: { content: [{ type: 'image', attachment: { attachmentId: `sha256:${referenced}` } }] } }],
+    },
+  }, home);
+  const { ctx, routes } = makeCtx(home, () => [], { persistence });
+  apply(ctx);
+
+  // Deleting alpha leaves both objects unreferenced: the scan says so up front.
+  const scan = await post(routes, '/plugins/archived-purge/scan', { sessionIds: ['session-alpha'] });
+  assert.equal(scan.status, 200);
+  assert.equal(scan.payload.attachments.orphanObjects, 2);
+  assert.equal(scan.payload.attachments.orphanBytes, 192);
+  assert.equal(scan.payload.attachments.keptObjects, 0);
+
+  // A plain sweep keeps `referenced`, because alpha's log still references it,
+  // and drops the already-orphaned object.
+  const idle = await post(routes, '/plugins/archived-purge/gc', {});
+  assert.equal(idle.payload.dryRun, true);
+  assert.equal(idle.payload.orphanObjects, 1, 'only the unreferenced object is collectable');
+
+  const removed = await post(routes, '/plugins/archived-purge/gc', { dryRun: false });
+  assert.equal(removed.payload.ok, true);
+  assert.equal(removed.payload.removedObjects, 1);
+  await fsp.stat(path.join(objectsRoot, referenced.slice(0, 2), referenced));
+
+  // Deleting alpha with the deep clean on removes its now-unreferenced object.
+  const del = await callDelete(routes, ['session-alpha'], { attachments: true });
+  assert.equal(del.payload.ok, true);
+  assert.equal(del.payload.gc.removedObjects, 1);
+  assert.equal(del.payload.gc.removedBytes, 128);
+  await assert.rejects(fsp.stat(path.join(objectsRoot, referenced.slice(0, 2), referenced)));
+});
+
+test('gc fails closed when a Session log cannot be read', async () => {
+  const { home } = await makeHome();
+  process.env.DSH_HOME = home;
+  const objectsRoot = path.join(home, 'attachments', 'v1', 'objects');
+  await writeObject(objectsRoot, digest('c'), 32);
+  const persistence = fakePersistence({
+    'session-alpha': { cwd: 'C:\\tmp\\proj', unreadable: true, events: [] },
+  }, home);
+  const { ctx, routes } = makeCtx(home, () => [], { persistence });
+  apply(ctx);
+
+  const result = await post(routes, '/plugins/archived-purge/gc', { dryRun: false });
+  assert.equal(result.payload.ok, false);
+  assert.equal(result.payload.code, 'unreadable-session');
+  await fsp.stat(path.join(objectsRoot, 'cc', digest('c')));
+});
+
+test('deep clean deletes only artifacts the scan offered and clears the image cache', async () => {
+  const { home } = await makeHome();
+  process.env.DSH_HOME = home;
+  const cwd = await fsp.mkdtemp(path.join(os.tmpdir(), 'purge-workspace-'));
+  await fsp.mkdir(cwd, { recursive: true });
+  const produced = path.join(cwd, 'report.md');
+  const untouched = path.join(cwd, 'keep.md');
+  await fsp.writeFile(produced, 'hello');
+  await fsp.writeFile(untouched, 'keep');
+  const cacheDir = path.join(home, 'cache', 'attachments', 'request-images', 'ab');
+  await fsp.mkdir(cacheDir, { recursive: true });
+  await fsp.writeFile(path.join(cacheDir, digest('d')), Buffer.alloc(40, 1));
+
+  const persistence = fakePersistence({
+    'session-alpha': {
+      cwd,
+      events: [{ type: 'tool/call', data: { name: 'write', arguments: JSON.stringify({ file_path: produced }) } }],
+    },
+  }, home);
+  const { ctx, routes } = makeCtx(home, () => [], { persistence });
+  apply(ctx);
+
+  const scan = await post(routes, '/plugins/archived-purge/scan', { sessionIds: ['session-alpha'] });
+  assert.deepEqual(scan.payload.artifacts.map((file) => file.path), [produced]);
+  assert.equal(scan.payload.requestImages.files, 1);
+
+  const del = await callDelete(routes, ['session-alpha'], {
+    files: [produced, untouched],
+    requestImages: true,
+  });
+  assert.equal(del.payload.ok, true);
+  assert.equal(del.payload.artifacts.deleted, 1);
+  assert.equal(del.payload.artifacts.results[1].ok, false);
+  assert.equal(del.payload.artifacts.results[1].code, 'not-offered');
+  assert.equal(del.payload.gc.requestImages.removedFiles, 1);
+  await assert.rejects(fsp.stat(produced));
+  assert.ok((await fsp.stat(untouched)).isFile(), 'an unticked sibling survives');
 });

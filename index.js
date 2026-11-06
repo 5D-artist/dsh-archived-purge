@@ -29,6 +29,16 @@ import { promises as fsp } from 'node:fs';
 import path from 'node:path';
 import os from 'node:os';
 
+import {
+  collectAttachmentReferences,
+  deleteArtifactFiles,
+  pickOrphans,
+  pruneEmptyDirs,
+  removeFiles,
+  scanSessionArtifacts,
+  walkFiles,
+} from './lib/clean.js';
+
 export const name = 'archived-purge';
 export const inject = ['webServer', 'workspaceRegistry', 'sessions', 'sessionPersistence'];
 
@@ -40,6 +50,12 @@ const ID_RE = /^[A-Za-z0-9][A-Za-z0-9_-]{0,199}$/;
 const MAX_IDS = 500;
 const MAX_BODY = 64 * 1024;
 const MAX_CASCADE_DEPTH = 8;
+/**
+ * Objects younger than this are never collected: an attachment is published
+ * before the event that references it is appended, and a live Session's log may
+ * lag its in-memory state by one checkpoint.
+ */
+const GC_MIN_AGE_MS = 10 * 60 * 1000;
 
 function resolveHome() {
   const env = process.env.DSH_HOME;
@@ -194,6 +210,8 @@ export function createHandlers(deps) {
   const { home, sessions, workspaceRegistry, sessionPersistence, activity } = deps;
   const sessionsRoot = path.join(home, 'sessions');
   const cacheRoot = path.join(home, 'storages', 'session_projcache', 'sessions');
+  const attachmentsRoot = path.join(home, 'attachments', 'v1', 'objects');
+  const requestImagesRoot = path.join(home, 'cache', 'attachments', 'request-images');
 
   /**
    * The work families a Session still reports, e.g. `['turn']`. An absent
@@ -221,6 +239,84 @@ export function createHandlers(deps) {
     } catch {
       return false;
     }
+  }
+
+  /** Session id → the directory that Session could write into. */
+  async function cwdBySession() {
+    const map = new Map();
+    if (sessionPersistence && typeof sessionPersistence.list === 'function') {
+      try {
+        for (const snapshot of await sessionPersistence.list()) {
+          const id = snapshot?.header?.id;
+          const cwd = snapshot?.header?.cwd;
+          if (typeof id === 'string' && typeof cwd === 'string') map.set(id, cwd);
+        }
+      } catch {
+        /* fall back to the workspace records below */
+      }
+    }
+    const { workspaces } = await readArchivedState(home);
+    for (const record of Object.values(workspaces)) {
+      if (!record || !Array.isArray(record.sessionIds) || typeof record.path !== 'string') continue;
+      for (const id of record.sessionIds) if (!map.has(id)) map.set(id, record.path);
+    }
+    return map;
+  }
+
+  /**
+   * Reference-aware view of the attachment store for a hypothetical state where
+   * `skipIds` no longer exist: what the logs still reference, and what would
+   * become garbage.
+   * @param {Set<string>} skipIds - Sessions assumed to be gone.
+   * @returns {Promise<object>} totals plus the orphan entries a purge would remove.
+   */
+  async function attachmentPlan(skipIds) {
+    const objects = await walkFiles(attachmentsRoot);
+    const totalBytes = objects.reduce((sum, object) => sum + object.bytes, 0);
+    let refs;
+    try {
+      refs = await collectAttachmentReferences({ sessionPersistence, skipIds });
+    } catch (error) {
+      return { objects, totalBytes, blocked: 'reference-scan-failed', message: formatError(error) };
+    }
+    if (refs.unavailable) return { objects, totalBytes, blocked: 'persistence-unavailable', scanned: 0 };
+    if (refs.failures.length > 0) {
+      // Fail closed: an unreadable log may be the only owner of an object.
+      return {
+        objects,
+        totalBytes,
+        blocked: 'unreadable-session',
+        scanned: refs.scanned.length,
+        failures: refs.failures,
+      };
+    }
+    const picked = pickOrphans(objects, refs.keep, Date.now(), GC_MIN_AGE_MS);
+    return {
+      objects,
+      totalBytes,
+      scanned: refs.scanned.length,
+      keptObjects: picked.kept,
+      orphans: picked.orphans,
+      orphanObjects: picked.orphans.length,
+      orphanBytes: picked.bytes,
+    };
+  }
+
+  /** The derived downscale cache: regenerable, so a deep clean may clear it. */
+  async function requestImagesPlan() {
+    const entries = await walkFiles(requestImagesRoot);
+    return { files: entries, bytes: entries.reduce((sum, entry) => sum + entry.bytes, 0) };
+  }
+
+  /** Workspace files the given Sessions explicitly wrote or presented. */
+  async function artifactScan(ids) {
+    const map = await cwdBySession();
+    return scanSessionArtifacts({
+      sessionPersistence,
+      sessionIds: ids,
+      home,
+      workspacesBySession: map,
+    });
   }
 
   async function state() {
@@ -460,7 +556,7 @@ export function createHandlers(deps) {
     return done;
   }
 
-  async function remove(requested) {
+  async function remove(requested, options = {}) {
     if (!Array.isArray(requested) || requested.length === 0) {
       return { ok: false, code: 'invalid-request', message: 'sessionIds 不能为空' };
     }
@@ -523,6 +619,14 @@ export function createHandlers(deps) {
       };
     }
 
+    // Deep clean needs the artifact list while the logs are still readable: the
+    // allowed set is derived here, never taken from the request.
+    let artifactFiles = [];
+    if (Array.isArray(options?.files) && options.files.length > 0) {
+      const scanned = await artifactScan(ids);
+      artifactFiles = scanned.files;
+    }
+
     const results = [];
     for (const id of ids) {
       const result = await removeOne(id, dirs.get(id) ?? [], { cascade: false }, workspaces);
@@ -532,6 +636,35 @@ export function createHandlers(deps) {
       const result = await removeOne(id, dirs.get(id) ?? [], { cascade: true }, workspaces);
       results.push({ ...result, child: true });
     }
+
+    let artifacts;
+    if (artifactFiles.length > 0) {
+      // Only files owned by Sessions that really went away stay on the table.
+      const gone = new Set(results.filter((item) => item.ok).map((item) => item.id));
+      const allowed = artifactFiles.filter((file) => file.sessions.some((id) => gone.has(id)));
+      if (allowed.length > 0) {
+        artifacts = await deleteArtifactFiles({ files: allowed, requested: options.files, home });
+      }
+    }
+
+    let gc;
+    if (options?.attachments === true) {
+      const plan = await attachmentPlan(new Set());
+      if (plan.blocked) {
+        gc = { blocked: plan.blocked, message: plan.message, failures: plan.failures };
+      } else {
+        const removal = await removeFiles(plan.orphans);
+        await pruneEmptyDirs(attachmentsRoot);
+        gc = { removedObjects: removal.removed, removedBytes: removal.bytes, failures: removal.failures };
+      }
+    }
+    if (options?.requestImages === true) {
+      const images = await requestImagesPlan();
+      const cleared = await removeFiles(images.files);
+      await pruneEmptyDirs(requestImagesRoot);
+      gc = { ...(gc ?? {}), requestImages: { removedFiles: cleared.removed, bytes: cleared.bytes, failures: cleared.failures } };
+    }
+
     const deleted = results.filter((item) => item.ok);
     const failed = results.filter((item) => !item.ok);
     const deferred = results.filter((item) => item.ok && item.deferred).map((item) => item.id);
@@ -547,6 +680,8 @@ export function createHandlers(deps) {
       failed: failed.length,
       deferred,
       finalized,
+      artifacts,
+      gc,
       removedBytes: results.reduce((sum, item) => sum + (item.removedBytes ?? 0), 0),
       results,
       archivedCount: archived.length,
@@ -554,7 +689,92 @@ export function createHandlers(deps) {
     };
   }
 
-  return { state, remove, finalizePending, sessionsRoot, cacheRoot };
+  /**
+   * Dry-run or execute the reference-aware attachment sweep, independent of any
+   * Session deletion.
+   * @param {{dryRun?: boolean, requestImages?: boolean}} [options] - whether to only report.
+   * @returns {Promise<object>} totals, removals, and the failures worth showing.
+   */
+  async function collectGarbage(options = {}) {
+    const plan = await attachmentPlan(new Set());
+    const images = await requestImagesPlan();
+    if (plan.blocked) {
+      return {
+        ok: false,
+        code: plan.blocked,
+        message: plan.message ?? '无法确认附件引用关系，已取消清理',
+        failures: plan.failures,
+        requestImages: { files: images.files.length, bytes: images.bytes },
+      };
+    }
+    if (options.dryRun !== false) {
+      return {
+        ok: true,
+        dryRun: true,
+        orphanObjects: plan.orphanObjects,
+        orphanBytes: plan.orphanBytes,
+        totalObjects: plan.objects.length,
+        totalBytes: plan.totalBytes,
+        scannedSessions: plan.scanned,
+        requestImages: { files: images.files.length, bytes: images.bytes },
+      };
+    }
+    const removal = await removeFiles(plan.orphans);
+    await pruneEmptyDirs(attachmentsRoot);
+    const result = {
+      ok: removal.failures.length === 0,
+      dryRun: false,
+      removedObjects: removal.removed,
+      removedBytes: removal.bytes,
+      failures: removal.failures,
+      scannedSessions: plan.scanned,
+    };
+    if (options.requestImages === true) {
+      const cleared = await removeFiles(images.files);
+      await pruneEmptyDirs(requestImagesRoot);
+      result.requestImages = { removedFiles: cleared.removed, bytes: cleared.bytes, failures: cleared.failures };
+    } else {
+      result.requestImages = { files: images.files.length, bytes: images.bytes };
+    }
+    return result;
+  }
+
+  /**
+   * Read-only plan for a deep clean: what the given Sessions would leave behind
+   * (attachments), what the derived cache costs, and which workspace files they
+   * explicitly produced.
+   * @param {string[]} ids - Sessions the caller is about to delete.
+   * @returns {Promise<object>} report consumed by the settings page.
+   */
+  async function scanAll(ids) {
+    const plan = await attachmentPlan(new Set(ids));
+    const images = await requestImagesPlan();
+    const { files, unreadable } = await artifactScan(ids);
+    return {
+      ok: true,
+      attachments: {
+        objects: plan.objects.length,
+        bytes: plan.totalBytes,
+        orphanObjects: plan.orphanObjects ?? null,
+        orphanBytes: plan.orphanBytes ?? null,
+        keptObjects: plan.keptObjects ?? null,
+        scannedSessions: plan.scanned ?? 0,
+        blocked: plan.blocked,
+        failures: plan.failures,
+      },
+      requestImages: { files: images.files.length, bytes: images.bytes },
+      artifacts: files.map((file) => ({
+        path: file.path,
+        bytes: file.bytes,
+        mtime: file.mtime,
+        tools: file.tools,
+        sessions: file.sessions,
+      })),
+      unreadableSessions: unreadable,
+    };
+  }
+
+  return { state, remove, finalizePending, collectGarbage, scanAll, sessionsRoot, cacheRoot };
 }
 
 function readBody(req) {
@@ -670,11 +890,86 @@ export function apply(ctx) {
         return;
       }
       try {
-        const result = await handlers.remove(payload?.sessionIds);
+        const result = await handlers.remove(payload?.sessionIds, {
+          files: payload?.files,
+          attachments: payload?.attachments === true,
+          requestImages: payload?.requestImages === true,
+        });
         // A well-formed request that removed nothing is a business outcome,
         // not a transport failure: 200 keeps `result.message` and
         // `result.results` readable instead of surfacing a bare "HTTP 400".
         send(res, 200, result);
+      } catch (error) {
+        send(res, 500, { ok: false, code: 'internal', message: formatError(error) });
+      }
+    },
+  }));
+
+  ctx.effect(() => ctx.webServer.register({
+    kind: 'exact',
+    path: `${ROUTE}/scan`,
+    async handler(req, res) {
+      if (req.method !== 'POST') {
+        send(res, 405, { ok: false, code: 'method-not-allowed' });
+        return;
+      }
+      if (!sameOrigin(req)) {
+        send(res, 403, { ok: false, code: 'foreign-origin' });
+        return;
+      }
+      const type = String(req.headers['content-type'] ?? '');
+      if (!type.includes('application/json')) {
+        send(res, 415, { ok: false, code: 'content-type-required' });
+        return;
+      }
+      let payload;
+      try {
+        payload = JSON.parse(await readBody(req));
+      } catch (error) {
+        send(res, 400, { ok: false, code: 'invalid-json', message: formatError(error) });
+        return;
+      }
+      const ids = Array.isArray(payload?.sessionIds)
+        ? payload.sessionIds.filter((id) => typeof id === 'string' && ID_RE.test(id))
+        : [];
+      try {
+        send(res, 200, await handlers.scanAll(ids));
+      } catch (error) {
+        send(res, 500, { ok: false, code: 'internal', message: formatError(error) });
+      }
+    },
+  }));
+
+  ctx.effect(() => ctx.webServer.register({
+    kind: 'exact',
+    path: `${ROUTE}/gc`,
+    async handler(req, res) {
+      if (req.method !== 'POST') {
+        send(res, 405, { ok: false, code: 'method-not-allowed' });
+        return;
+      }
+      if (!sameOrigin(req)) {
+        send(res, 403, { ok: false, code: 'foreign-origin' });
+        return;
+      }
+      const type = String(req.headers['content-type'] ?? '');
+      if (!type.includes('application/json')) {
+        send(res, 415, { ok: false, code: 'content-type-required' });
+        return;
+      }
+      let payload;
+      try {
+        payload = JSON.parse(await readBody(req));
+      } catch (error) {
+        send(res, 400, { ok: false, code: 'invalid-json', message: formatError(error) });
+        return;
+      }
+      try {
+        // `dryRun` must be explicitly false to delete anything.
+        send(res, 200, await handlers.collectGarbage({
+          dryRun: payload?.dryRun !== false,
+          requestImages: payload?.requestImages === true,
+        }));
       } catch (error) {
         send(res, 500, { ok: false, code: 'internal', message: formatError(error) });
       }
