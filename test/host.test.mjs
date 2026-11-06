@@ -120,7 +120,7 @@ test('delete removes log, cache, accounting and archive marker', async () => {
   assert.deepEqual(after.archived, ['session-alpha', 'session-beta'], 'host never rewrites workspace.json directly');
 });
 
-test('refuses a live session and leaves its files alone', async () => {
+test('refuses a Session that still reports work and leaves its files alone', async () => {
   const { home, project, cache } = await makeHome();
   const alphaDir = await makeSession(project, 'session-alpha', 256);
   await makeCache(cache, 'session-alpha', 'Alpha');
@@ -128,15 +128,110 @@ test('refuses a live session and leaves its files alone', async () => {
 
   const handlers = createHandlers({
     home,
-    sessions: { get: (id) => (id === 'session-alpha' ? { id } : undefined) },
+    sessions: { get: () => undefined },
+    activity: async (id) => (id === 'session-alpha' ? [{ kind: 'turn' }] : []),
     workspaceRegistry: makeRegistry(['session-alpha']).registry,
     sessionPersistence: undefined,
   });
   const result = await handlers.remove(['session-alpha']);
   assert.equal(result.ok, false);
-  assert.equal(result.failed, 1);
-  assert.equal(result.results[0].code, 'session-active');
+  assert.equal(result.code, 'session-active');
+  assert.equal(result.deleted, 0, 'nothing is attempted when the batch is refused');
+  assert.deepEqual(result.active, [{ id: 'session-alpha', kinds: ['turn'] }]);
   assert.ok((await fsp.stat(alphaDir)).isDirectory());
+  assert.ok((await fsp.stat(path.join(cache, 'session-alpha.json'))).isFile());
+});
+
+test('deletes an archived Session that is resident but idle (regression)', async () => {
+  // Archiving hides a Session without disposing it, so every recently used
+  // archived Session is still in the store. Presence used to be read as
+  // liveness, which refused every delete with HTTP 400.
+  const { home, project, cache } = await makeHome();
+  const alphaDir = await makeSession(project, 'session-alpha', 2048);
+  await makeCache(cache, 'session-alpha', 'Alpha');
+  await writeRegistry(home, ['session-alpha'], ['session-alpha']);
+
+  const { registry, detached, unarchived } = makeRegistry(['session-alpha']);
+  const handlers = createHandlers({
+    home,
+    sessions: { get: (id) => (id === 'session-alpha' ? { id } : undefined) },
+    activity: async () => [],
+    workspaceRegistry: registry,
+    sessionPersistence: undefined,
+  });
+
+  const state = await handlers.state();
+  assert.equal(state.items[0].resident, true);
+  assert.equal(state.items[0].active, false);
+
+  const result = await handlers.remove(['session-alpha']);
+  assert.equal(result.ok, true);
+  assert.equal(result.deleted, 1);
+  await assert.rejects(fsp.stat(alphaDir));
+  assert.deepEqual(detached, ['session-alpha']);
+  assert.deepEqual(unarchived, ['session-alpha']);
+});
+
+test('refuses the whole batch when one Session still reports work', async () => {
+  const { home, project, cache } = await makeHome();
+  const alphaDir = await makeSession(project, 'session-alpha', 128);
+  const betaDir = await makeSession(project, 'session-beta', 128);
+  await makeCache(cache, 'session-alpha', 'Alpha');
+  await makeCache(cache, 'session-beta', 'Beta');
+  await writeRegistry(home, ['session-alpha', 'session-beta'], ['session-alpha', 'session-beta']);
+
+  const { registry, detached, unarchived } = makeRegistry(['session-alpha', 'session-beta']);
+  const handlers = createHandlers({
+    home,
+    sessions: { get: () => undefined },
+    activity: async (id) => (id === 'session-beta' ? ['job', 'schedule'] : []),
+    workspaceRegistry: registry,
+    sessionPersistence: undefined,
+  });
+
+  const result = await handlers.remove(['session-alpha', 'session-beta']);
+  assert.equal(result.ok, false);
+  assert.equal(result.code, 'session-active');
+  assert.deepEqual(result.active, [{ id: 'session-beta', kinds: ['job', 'schedule'] }]);
+  assert.ok((await fsp.stat(alphaDir)).isDirectory(), 'an idle sibling must not be deleted either');
+  assert.ok((await fsp.stat(betaDir)).isDirectory());
+  assert.ok((await fsp.stat(path.join(cache, 'session-alpha.json'))).isFile());
+  assert.deepEqual(detached, []);
+  assert.deepEqual(unarchived, []);
+});
+
+test('refuses the batch when the activity probe itself fails', async () => {
+  const { home, project } = await makeHome();
+  await makeSession(project, 'session-alpha', 64);
+  await writeRegistry(home, ['session-alpha'], ['session-alpha']);
+  const handlers = createHandlers({
+    home,
+    sessions: { get: () => undefined },
+    activity: async () => { throw new Error('waterfall exploded'); },
+    workspaceRegistry: makeRegistry(['session-alpha']).registry,
+    sessionPersistence: undefined,
+  });
+  const result = await handlers.remove(['session-alpha']);
+  assert.equal(result.ok, false);
+  assert.equal(result.code, 'activity-unknown');
+  assert.match(result.message, /waterfall exploded/);
+});
+
+test('marks an unknown activity state in the listing instead of calling it running', async () => {
+  const { home, project } = await makeHome();
+  await makeSession(project, 'session-alpha', 64);
+  await writeRegistry(home, ['session-alpha'], ['session-alpha']);
+  const handlers = createHandlers({
+    home,
+    sessions: { get: () => ({ id: 'session-alpha' }) },
+    activity: async () => { throw new Error('no probe'); },
+    workspaceRegistry: makeRegistry(['session-alpha']).registry,
+    sessionPersistence: undefined,
+  });
+  const state = await handlers.state();
+  assert.equal(state.items[0].active, false);
+  assert.equal(state.items[0].activityUnknown, true);
+  assert.equal(state.items[0].resident, true);
 });
 
 test('rejects malformed ids and non-archived ids', async () => {

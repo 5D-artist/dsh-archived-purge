@@ -37,13 +37,18 @@ window.__ModuleLoader__.load({
       lastActivity: '最后活动',
       missing: '日志缺失',
       live: '运行中',
+      activeTurn: '对话运行中',
+      activeJob: '后台任务运行中',
+      activeSubagent: '子代理运行中',
+      activeSchedule: '定时任务唤醒中',
+      activityUnknown: '运行状态未知',
       ungrouped: '未归组会话',
       loadFailed: '读取归档列表失败',
       deleteFailed: '删除失败',
       retry: '重试',
       noticeDeleted: '已删除',
       noticeFreed: '释放',
-      noticePartial: '部分删除失败',
+      noticeFailed: '删除未完成',
       irreversible: '此操作不可撤销',
       countUnit: '个会话',
     };
@@ -69,13 +74,18 @@ window.__ModuleLoader__.load({
       lastActivity: 'Last activity',
       missing: 'Log missing',
       live: 'Running',
+      activeTurn: 'Turn running',
+      activeJob: 'Job running',
+      activeSubagent: 'Subagent running',
+      activeSchedule: 'Schedule waking',
+      activityUnknown: 'Activity unknown',
       ungrouped: 'Ungrouped sessions',
       loadFailed: 'Failed to read archived sessions',
       deleteFailed: 'Deletion failed',
       retry: 'Retry',
       noticeDeleted: 'Deleted',
       noticeFreed: 'Freed',
-      noticePartial: 'Partly failed',
+      noticeFailed: 'Deletion not completed',
       irreversible: 'This action cannot be undone',
       countUnit: 'sessions',
     };
@@ -118,6 +128,7 @@ window.__ModuleLoader__.load({
       .ap-notice { padding: 8px 12px; border-radius: 8px; font-size: 12px; line-height: 1.5;
         border: 1px solid var(--dsw-alias-border-l1); background: var(--dsw-alias-bg-layer-1); }
       .ap-notice.ap-error { border-color: var(--dsw-alias-state-error-primary); color: var(--dsw-alias-state-error-primary); }
+      .ap-noticelist { margin: 6px 0 0; padding-left: 18px; max-height: 160px; overflow: auto; }
       .ap-empty { padding: 36px 12px; text-align: center; border: 1px dashed var(--dsw-alias-border-l2); border-radius: 10px; }
       .ap-empty-title { font-size: 13px; margin-bottom: 4px; }
       .ap-empty-hint { font-size: 12px; color: var(--dsw-alias-label-secondary); }
@@ -141,6 +152,20 @@ window.__ModuleLoader__.load({
         unit += 1;
       }
       return `${value >= 10 || unit === 0 ? Math.round(value) : value.toFixed(1)} ${units[unit]}`;
+    }
+
+    // Activity families reported by the Host's `workspace/session-activity`
+    // waterfall; unknown families fall back to their raw name.
+    const ACTIVITY_LABELS = {
+      turn: 'activeTurn',
+      job: 'activeJob',
+      subagent: 'activeSubagent',
+      schedule: 'activeSchedule',
+    };
+
+    function activityLabel(t, kind) {
+      const key = ACTIVITY_LABELS[kind];
+      return key ? t(key) : String(kind ?? '');
     }
 
     async function request(path, init) {
@@ -254,6 +279,28 @@ window.__ModuleLoader__.load({
           return () => window.removeEventListener('keydown', onKey);
         }, [confirming, closeConfirm]);
 
+        const describeFailure = (payload) => {
+          const titleOf = (id) => items.find((entry) => entry.id === id)?.title || id;
+          const lines = [];
+          if (Array.isArray(payload?.active)) {
+            for (const entry of payload.active) {
+              const labels = (entry.kinds ?? []).map((kind) => activityLabel(t, kind)).join('、');
+              lines.push(`${titleOf(entry.id)} — ${labels || t('live')}`);
+            }
+          }
+          if (Array.isArray(payload?.results)) {
+            for (const entry of payload.results) {
+              if (!entry || entry.ok) continue;
+              const labels = (entry.activity ?? []).map((kind) => activityLabel(t, kind)).join('、');
+              const reason = entry.code === 'session-active'
+                ? labels || t('live')
+                : entry.message || entry.code || t('deleteFailed');
+              lines.push(`${titleOf(entry.id)} — ${reason}`);
+            }
+          }
+          return lines.slice(0, 8);
+        };
+
         const runDelete = async () => {
           const ids = [...selected];
           setConfirming(false);
@@ -265,24 +312,31 @@ window.__ModuleLoader__.load({
               headers: { 'content-type': 'application/json' },
               body: JSON.stringify({ sessionIds: ids }),
             });
-            setNotice({
-              kind: 'ok',
-              text: `${t('noticeDeleted')} ${result.deleted} ${t('countUnit')} · ${t('noticeFreed')} ${formatBytes(result.removedBytes)}`,
-            });
-            setSelected(new Set());
+            // The Host answers 200 for every well-formed request, including one
+            // that removed nothing; `ok` and `message` carry the outcome.
+            if (result?.ok) {
+              setNotice({
+                kind: 'ok',
+                text: `${t('noticeDeleted')} ${result.deleted ?? ids.length} ${t('countUnit')} · ${t('noticeFreed')} ${formatBytes(result.removedBytes)}`,
+              });
+              setSelected(new Set());
+            } else {
+              const details = describeFailure(result);
+              setNotice({
+                kind: 'error',
+                text: `${t('noticeFailed')}：${result?.message || t('deleteFailed')}`,
+                details,
+              });
+            }
             await load();
           } catch (cause) {
             const payload = cause?.payload;
-            if (payload && Array.isArray(payload.results)) {
-              setNotice({
-                kind: 'error',
-                text: `${t('noticePartial')}：${payload.deleted ?? 0} / ${(payload.deleted ?? 0) + (payload.failed ?? 0)} · ${payload.message ?? cause.message}`,
-              });
-              setSelected(new Set());
-              await load();
-            } else {
-              setNotice({ kind: 'error', text: `${t('deleteFailed')}：${cause?.message ?? ''}` });
-            }
+            const details = describeFailure(payload);
+            setNotice({
+              kind: 'error',
+              text: `${t('deleteFailed')}：${payload?.message || cause?.message || ''}`,
+              details,
+            });
           } finally {
             setBusy(false);
           }
@@ -334,7 +388,12 @@ window.__ModuleLoader__.load({
             ? h('div', { className: 'ap-notice ap-error' }, `${t('loadFailed')}：${error}`)
             : null,
           notice
-            ? h('div', { className: notice.kind === 'error' ? 'ap-notice ap-error' : 'ap-notice' }, notice.text)
+            ? h('div', { className: notice.kind === 'error' ? 'ap-notice ap-error' : 'ap-notice' },
+              h('div', null, notice.text),
+              Array.isArray(notice.details) && notice.details.length > 0
+                ? h('ul', { className: 'ap-noticelist' }, notice.details.map((line, index) => h('li', { key: index }, line)))
+                : null,
+            )
             : null,
           loading
             ? h('div', { className: 'ap-meta' }, '…')
@@ -358,7 +417,12 @@ window.__ModuleLoader__.load({
                         : null,
                       h('span', { className: 'ap-meta' }, `${t('size')} ${formatBytes(item.sizeBytes)}`),
                       item.exists ? null : h('span', { className: 'ap-tag ap-warn' }, t('missing')),
-                      item.live ? h('span', { className: 'ap-tag ap-live' }, t('live')) : null,
+                      item.active
+                        ? h('span', { className: 'ap-tag ap-live' }, activityLabel(t, item.activity?.[0]) || t('live'))
+                        : null,
+                      item.active ? null : item.activityUnknown
+                        ? h('span', { className: 'ap-tag ap-warn' }, t('activityUnknown'))
+                        : null,
                     ),
                   ),
                 )),

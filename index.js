@@ -11,8 +11,19 @@
  *   <DSH_HOME>/storages/session_projcache/sessions/<session-id>.json
  *
  * Deletion is guarded: ids are shape-checked, every path must stay inside the
- * two storage roots, a live Session is refused, and workspace accounting is
- * cleared through the public registry API rather than a raw registry rewrite.
+ * two storage roots, a Session that is still doing work is refused, and
+ * workspace accounting is cleared through the public registry API rather than
+ * a raw registry rewrite.
+ *
+ * Liveness is NOT `ctx.sessions.get(id)`. Archiving only hides a Session from
+ * the grouping surfaces; it never disposes it, so every archived Session that
+ * has been used in this process stays resident in the store. A resident
+ * Session is idle, not running — judging by presence alone refused every
+ * archived Session that was still warm and made "delete selected" always fail
+ * with a bare HTTP 400. The faithful signal is the
+ * `workspace/session-activity` waterfall, answered by the Agent registry
+ * (`turn`), the job registry, the subagent runtime and the scheduler; it is
+ * the same admission check `archiveSession` uses.
  */
 import { promises as fsp } from 'node:fs';
 import path from 'node:path';
@@ -20,6 +31,9 @@ import os from 'node:os';
 
 export const name = 'archived-purge';
 export const inject = ['webServer', 'workspaceRegistry', 'sessions', 'sessionPersistence'];
+
+/** Innermost `next` of the activity waterfall: no listener means no work. */
+const NO_ACTIVITY = () => Promise.resolve([]);
 
 const ROUTE = '/plugins/archived-purge';
 const ID_RE = /^[A-Za-z0-9][A-Za-z0-9_-]{0,199}$/;
@@ -177,22 +191,36 @@ async function readCacheDoc(cacheDir, sessionId) {
 }
 
 export function createHandlers(deps) {
-  const { home, sessions, agents, workspaceRegistry, sessionPersistence } = deps;
+  const { home, sessions, workspaceRegistry, sessionPersistence, activity } = deps;
   const sessionsRoot = path.join(home, 'sessions');
   const cacheRoot = path.join(home, 'storages', 'session_projcache', 'sessions');
 
-  function isLive(id) {
-    try {
-      if (sessions && typeof sessions.get === 'function' && sessions.get(id)) return true;
-    } catch {
-      /* treat an unavailable store as not live */
+  /**
+   * The work families a Session still reports, e.g. `['turn']`. An absent
+   * probe yields no activity; a throwing probe propagates so the caller can
+   * refuse instead of deleting a Session whose state is unknown.
+   * @param {string} id - session id.
+   * @returns {Promise<string[]>} distinct non-empty activity kinds.
+   */
+  async function activityKinds(id) {
+    if (typeof activity !== 'function') return [];
+    const reported = await activity(id);
+    if (!Array.isArray(reported)) return [];
+    const kinds = [];
+    for (const entry of reported) {
+      const kind = typeof entry === 'string' ? entry : entry && typeof entry === 'object' ? entry.kind : undefined;
+      if (typeof kind === 'string' && kind.length > 0 && !kinds.includes(kind)) kinds.push(kind);
     }
+    return kinds;
+  }
+
+  /** Whether the store still holds the Session in memory (informational only). */
+  function isResident(id) {
     try {
-      if (agents && typeof agents.get === 'function' && agents.get(id)) return true;
+      return Boolean(sessions && typeof sessions.get === 'function' && sessions.get(id));
     } catch {
-      /* ignore */
+      return false;
     }
-    return false;
   }
 
   async function state() {
@@ -221,6 +249,13 @@ export function createHandlers(deps) {
       if (cacheDoc) bytes += cacheBytes;
       const owner = workspaceOf(workspaces, id);
       const title = titleOfCache(cacheDoc);
+      let kinds = [];
+      let activityUnknown = false;
+      try {
+        kinds = await activityKinds(id);
+      } catch {
+        activityUnknown = true;
+      }
       items.push({
         id,
         title,
@@ -232,7 +267,10 @@ export function createHandlers(deps) {
         lastActivity: lastActivity || null,
         exists: sessionDirs.length > 0,
         cacheExists: Boolean(cacheDoc),
-        live: isLive(id),
+        active: kinds.length > 0,
+        activity: kinds,
+        activityUnknown,
+        resident: isResident(id),
       });
     }
     items.sort((a, b) => (b.lastActivity ?? 0) - (a.lastActivity ?? 0));
@@ -279,8 +317,16 @@ export function createHandlers(deps) {
   }
 
   async function removeOne(id, dirs, options, workspaces) {
-    if (isLive(id)) {
-      return { id, ok: false, code: 'session-active', message: '会话仍在运行，已跳过' };
+    // Re-checked per item: work can start between the batch pre-flight and the
+    // moment this file system call runs.
+    let kinds;
+    try {
+      kinds = await activityKinds(id);
+    } catch (error) {
+      return { id, ok: false, code: 'activity-unknown', message: formatError(error) };
+    }
+    if (kinds.length > 0) {
+      return { id, ok: false, code: 'session-active', message: '会话仍在运行，已跳过', activity: kinds };
     }
     let removedBytes = 0;
     const failures = [];
@@ -383,6 +429,39 @@ export function createHandlers(deps) {
     const dirs = await scanSessionDirs(sessionsRoot);
     const skip = new Set(ids);
     const childIds = await descendantsOf(ids, skip);
+
+    // Pre-flight the whole batch before touching any file: a single Session
+    // that is still working refuses the request and deletes nothing, so the
+    // list never ends up half-cleaned with an orphaned running log.
+    const active = [];
+    for (const id of [...ids, ...childIds]) {
+      let kinds;
+      try {
+        kinds = await activityKinds(id);
+      } catch (error) {
+        return {
+          ok: false,
+          code: 'activity-unknown',
+          message: `无法确认会话是否仍在运行，已取消本次删除：${formatError(error)}`,
+          deleted: 0,
+          failed: 0,
+          results: [],
+        };
+      }
+      if (kinds.length > 0) active.push({ id, kinds });
+    }
+    if (active.length > 0) {
+      return {
+        ok: false,
+        code: 'session-active',
+        message: `有 ${active.length} 个会话仍在运行，已取消本次删除`,
+        active,
+        deleted: 0,
+        failed: 0,
+        results: [],
+      };
+    }
+
     const results = [];
     for (const id of ids) {
       const result = await removeOne(id, dirs.get(id) ?? [], { cascade: false }, workspaces);
@@ -394,8 +473,13 @@ export function createHandlers(deps) {
     }
     const deleted = results.filter((item) => item.ok);
     const failed = results.filter((item) => !item.ok);
+    const ok = failed.length === 0;
     return {
-      ok: failed.length === 0,
+      ok,
+      code: ok ? undefined : 'delete-failed',
+      message: ok
+        ? `已删除 ${deleted.length} 个会话`
+        : `${failed.length} 个会话删除失败：${failed[0].message ?? failed[0].code ?? '未知错误'}`,
       deleted: deleted.length,
       failed: failed.length,
       removedBytes: results.reduce((sum, item) => sum + (item.removedBytes ?? 0), 0),
@@ -448,16 +532,18 @@ function send(res, status, payload) {
 
 export function apply(ctx) {
   const home = resolveHome();
-  let agents;
-  try {
-    agents = ctx.get ? ctx.get('agents') : undefined;
-  } catch {
-    agents = undefined;
-  }
+  // The registry-wide archive-admission check: every owner of running work
+  // answers here, exactly as it does for `archiveSession`.
+  const activity = async (sessionId) => {
+    if (typeof ctx.waterfall !== 'function') {
+      throw new Error('当前 Host 不支持 workspace/session-activity 事件，无法判定会话是否仍在运行');
+    }
+    return ctx.waterfall('workspace/session-activity', { sessionId }, NO_ACTIVITY);
+  };
   const handlers = createHandlers({
     home,
     sessions: ctx.sessions,
-    agents,
+    activity,
     workspaceRegistry: ctx.workspaceRegistry,
     sessionPersistence: ctx.sessionPersistence,
   });
@@ -512,7 +598,10 @@ export function apply(ctx) {
       }
       try {
         const result = await handlers.remove(payload?.sessionIds);
-        send(res, result.ok ? 200 : 400, result);
+        // A well-formed request that removed nothing is a business outcome,
+        // not a transport failure: 200 keeps `result.message` and
+        // `result.results` readable instead of surfacing a bare "HTTP 400".
+        send(res, 200, result);
       } catch (error) {
         send(res, 500, { ok: false, code: 'internal', message: formatError(error) });
       }
