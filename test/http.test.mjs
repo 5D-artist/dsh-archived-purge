@@ -416,3 +416,29 @@ test('deep clean deletes only artifacts the scan offered and clears the image ca
   await assert.rejects(fsp.stat(produced));
   assert.ok((await fsp.stat(untouched)).isFile(), 'an unticked sibling survives');
 });
+
+test('the everything switch deletes every attributed file and nothing else', async () => {
+  const { home } = await makeHome();
+  process.env.DSH_HOME = home;
+  const cwd = await fsp.mkdtemp(path.join(os.tmpdir(), 'purge-everything-'));
+  const produced = path.join(cwd, 'report.md');
+  const sibling = path.join(cwd, 'keep.md');
+  await fsp.writeFile(produced, 'hello');
+  await fsp.writeFile(sibling, 'keep');
+
+  const persistence = fakePersistence({
+    'session-alpha': {
+      cwd,
+      events: [{ type: 'tool/call', data: { name: 'write', arguments: JSON.stringify({ file_path: produced }) } }],
+    },
+  }, home);
+  const { ctx, routes } = makeCtx(home, () => [], { persistence });
+  apply(ctx);
+
+  const del = await callDelete(routes, ['session-alpha'], { everything: true });
+  assert.equal(del.payload.ok, true);
+  assert.equal(del.payload.artifacts.deleted, 1);
+  assert.equal(del.payload.schedules, undefined, 'no Schedule service means no schedule report');
+  await assert.rejects(fsp.stat(produced));
+  assert.ok((await fsp.stat(sibling)).isFile(), 'a file the log never attributed survives');
+});

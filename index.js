@@ -15,6 +15,13 @@
  * workspace accounting is cleared through the public registry API rather than
  * a raw registry rewrite.
  *
+ * A "remove the materials too" delete (`everything: true`) derives the whole
+ * disposable set on the Host, never from the request: the workspace files the
+ * logs prove the Session wrote, the attachment objects nothing else references,
+ * and the scheduled tasks aimed at Sessions that no longer exist. Keeping the
+ * derivation server-side is what makes one click safe: the browser can only
+ * narrow the set, never widen it.
+ *
  * Liveness is NOT `ctx.sessions.get(id)`. Archiving only hides a Session from
  * the grouping surfaces; it never disposes it, so every archived Session that
  * has been used in this process stays resident in the store. A resident
@@ -211,7 +218,7 @@ async function readCacheDoc(cacheDir, sessionId) {
 }
 
 export function createHandlers(deps) {
-  const { home, sessions, workspaceRegistry, sessionPersistence, activity } = deps;
+  const { home, sessions, workspaceRegistry, sessionPersistence, activity, getSchedule } = deps;
   const sessionsRoot = path.join(home, 'sessions');
   const cacheRoot = path.join(home, 'storages', 'session_projcache', 'sessions');
   const attachmentsRoot = path.join(home, 'attachments', 'v1', 'objects');
@@ -306,6 +313,71 @@ export function createHandlers(deps) {
     };
   }
 
+  /**
+   * The optional Schedule service, resolved lazily: a Host without the
+   * Schedule plugin has no `schedule` service and simply has no tasks.
+   * @returns {object|undefined} the service or undefined.
+   */
+  function scheduleService() {
+    try {
+      return typeof getSchedule === 'function' ? getSchedule() : undefined;
+    } catch {
+      return undefined;
+    }
+  }
+
+  /**
+   * Scheduled tasks whose delivery target is one of `ids`. A task aimed at a
+   * removed Session can never fire again, so it is disposable with that
+   * Session — unlike a task that merely lists it as involved.
+   * @param {string[]} ids - Sessions that are about to disappear.
+   * @returns {Promise<{available: boolean, tasks: object[], message?: string}>}
+   */
+  async function scheduleTasksOf(ids) {
+    const service = scheduleService();
+    if (!service || typeof service.catalog !== 'function') return { available: false, tasks: [] };
+    let all;
+    try {
+      all = await service.catalog();
+    } catch (error) {
+      return { available: false, tasks: [], message: formatError(error) };
+    }
+    const wanted = new Set(ids);
+    const tasks = [];
+    for (const task of Array.isArray(all) ? all : []) {
+      const target = task?.target;
+      if (!target || target.kind === 'new') continue;
+      if (typeof target.sessionId !== 'string' || !wanted.has(target.sessionId)) continue;
+      tasks.push({
+        id: String(task.id),
+        title: typeof task.title === 'string' ? task.title : '',
+        status: typeof task.status === 'string' ? task.status : '',
+        targetSessionId: target.sessionId,
+      });
+    }
+    return { available: true, tasks };
+  }
+
+  /** Delete dead scheduled tasks one by one, reporting what refused. */
+  async function removeSchedules(tasks) {
+    const service = scheduleService();
+    const removed = [];
+    const failures = [];
+    for (const task of tasks) {
+      if (!service || typeof service.edit !== 'function') {
+        failures.push({ id: task.id, message: 'schedule service unavailable' });
+        continue;
+      }
+      try {
+        await service.edit({ id: task.id, action: 'delete' });
+        removed.push(task.id);
+      } catch (error) {
+        failures.push({ id: task.id, message: formatError(error) });
+      }
+    }
+    return { removed, failures };
+  }
+
   /** The derived downscale cache: regenerable, so a deep clean may clear it. */
   async function requestImagesPlan() {
     const entries = await walkFiles(requestImagesRoot);
@@ -327,6 +399,13 @@ export function createHandlers(deps) {
   async function state() {
     const { archived, workspaces } = await readArchivedState(home);
     const dirs = await scanSessionDirs(sessionsRoot);
+    // One catalog read tells every row whether deleting it would also retire a
+    // scheduled task; the map keeps the per-row cost at a lookup.
+    const scheduled = await scheduleTasksOf(archived);
+    const scheduleCounts = new Map();
+    for (const task of scheduled.tasks) {
+      scheduleCounts.set(task.targetSessionId, (scheduleCounts.get(task.targetSessionId) ?? 0) + 1);
+    }
     const items = [];
     let pendingFinalize = 0;
     for (const id of archived) {
@@ -380,6 +459,7 @@ export function createHandlers(deps) {
         activity: kinds,
         activityUnknown,
         resident: isResident(id),
+        scheduleCount: scheduleCounts.get(id) ?? 0,
       });
     }
     items.sort((a, b) => (b.lastActivity ?? 0) - (a.lastActivity ?? 0));
@@ -629,6 +709,7 @@ export function createHandlers(deps) {
     // must be derived here, while the log is still readable; the request never
     // decides what is allowed.
     const scannedArtifacts = await artifactScan([...ids, ...childIds]);
+    const schedulePlan = await scheduleTasksOf([...ids, ...childIds]);
     const artifactFiles = scannedArtifacts.files;
     const artifactCwd = scannedArtifacts.cwds ?? new Map();
     const titles = new Map();
@@ -647,20 +728,36 @@ export function createHandlers(deps) {
       results.push({ ...result, child: true });
     }
 
+    // Only files owned by Sessions that really went away stay on the table.
+    const gone = new Set(results.filter((item) => item.ok).map((item) => item.id));
+    const owned = artifactFiles.filter((file) => file.sessions.some((id) => gone.has(id)));
+    const wantedFiles = options?.everything === true
+      ? owned.map((file) => file.path)
+      : (Array.isArray(options?.files) ? options.files : []);
     let artifacts;
-    if (Array.isArray(options?.files) && options.files.length > 0) {
-      // Only files owned by Sessions that really went away stay on the table.
-      const gone = new Set(results.filter((item) => item.ok).map((item) => item.id));
-      const allowed = artifactFiles.filter((file) => file.sessions.some((id) => gone.has(id)));
-      if (allowed.length > 0) {
-        artifacts = await deleteArtifactFiles({ files: allowed, requested: options.files, home });
+    if (owned.length > 0 && wantedFiles.length > 0) {
+      artifacts = await deleteArtifactFiles({ files: owned, requested: wantedFiles, home });
+    }
+
+    // A task targeting a removed Session is dead weight: retire it so the
+    // schedule list does not accumulate rows that can never be delivered.
+    let schedules;
+    if (options?.schedules !== false) {
+      const targets = schedulePlan.tasks.filter((task) => gone.has(task.targetSessionId));
+      if (targets.length > 0) {
+        const removal = await removeSchedules(targets);
+        schedules = {
+          deleted: removal.removed.length,
+          failed: removal.failures.length,
+          failures: removal.failures,
+          tasks: targets.length,
+        };
       }
     }
 
     // Record what the removed Sessions had produced, so a later scan can still
     // find those files once their logs (and their attribution) are gone.
     try {
-      const gone = new Set(results.filter((item) => item.ok).map((item) => item.id));
       const records = [...gone].map((id) => ({
         id,
         title: titles.get(id) ?? '',
@@ -676,7 +773,7 @@ export function createHandlers(deps) {
     }
 
     let gc;
-    if (options?.attachments === true) {
+    if (options?.everything === true || options?.attachments === true) {
       const plan = await attachmentPlan(new Set());
       if (plan.blocked) {
         gc = { blocked: plan.blocked, message: plan.message, failures: plan.failures };
@@ -709,6 +806,7 @@ export function createHandlers(deps) {
       deferred,
       finalized,
       artifacts,
+      schedules,
       gc,
       removedBytes: results.reduce((sum, item) => sum + (item.removedBytes ?? 0), 0),
       results,
@@ -778,6 +876,7 @@ export function createHandlers(deps) {
     const plan = await attachmentPlan(new Set(ids));
     const images = await requestImagesPlan();
     const { files, unreadable } = await artifactScan(ids);
+    const scheduled = await scheduleTasksOf(ids);
     return {
       ok: true,
       attachments: {
@@ -799,6 +898,12 @@ export function createHandlers(deps) {
         sessions: file.sessions,
       })),
       unreadableSessions: unreadable,
+      schedules: {
+        available: scheduled.available,
+        count: scheduled.tasks.length,
+        items: scheduled.tasks,
+        message: scheduled.message,
+      },
     };
   }
 
@@ -1074,12 +1179,22 @@ export function apply(ctx) {
     }
     return ctx.waterfall('workspace/session-activity', { sessionId }, NO_ACTIVITY);
   };
+  // The Schedule service is optional: a profile without the schedule plugin
+  // must still be able to purge archived Sessions.
+  const getSchedule = () => {
+    try {
+      return typeof ctx.get === 'function' ? ctx.get('schedule') : undefined;
+    } catch {
+      return undefined;
+    }
+  };
   const handlers = createHandlers({
     home,
     sessions: ctx.sessions,
     activity,
     workspaceRegistry: ctx.workspaceRegistry,
     sessionPersistence: ctx.sessionPersistence,
+    getSchedule,
   });
 
   // A delete that ran against a resident Session leaves its bookkeeping behind
@@ -1141,6 +1256,9 @@ export function apply(ctx) {
       try {
         const result = await handlers.remove(payload?.sessionIds, {
           files: payload?.files,
+          // One switch for the whole derived set; the Host still decides what
+          // is eligible, so a crafted `everything` can never reach more.
+          everything: payload?.everything === true,
           attachments: payload?.attachments === true,
           requestImages: payload?.requestImages === true,
         });

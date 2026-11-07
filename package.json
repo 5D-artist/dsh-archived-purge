@@ -1,8 +1,8 @@
 {
   "name": "dsh-archived-purge",
-  "version": "1.2.0",
+  "version": "1.3.0",
   "type": "module",
-  "description": "Select-all cleanup for archived DeepSeek Harness sessions: permanently delete the session log, projection cache, workspace accounting and archive marker together.",
+  "description": "Select-all cleanup for archived DeepSeek Harness sessions: permanently delete the session log, projection cache, workspace accounting, archive marker, the files the Session produced, and the scheduled tasks aimed at it.",
   "keywords": [
     "dsh",
     "dsh-plugin",

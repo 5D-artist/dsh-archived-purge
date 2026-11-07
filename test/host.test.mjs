@@ -349,6 +349,73 @@ test('cascades archived parents into subagent-origin descendants only', async ()
   assert.ok((await fsp.stat(forkDir)).isDirectory(), 'ordinary fork must survive');
 });
 
+test('a deep clean removes produced files and the tasks aimed at the Sessions', async () => {
+  const { home, project, cache } = await makeHome();
+  await makeSession(project, 'session-alpha', 128);
+  await makeCache(cache, 'session-alpha', 'Alpha');
+  await writeRegistry(home, ['session-alpha'], ['session-alpha']);
+  const cwd = await fsp.mkdtemp(path.join(os.tmpdir(), 'purge-artifacts-'));
+  const produced = path.join(cwd, 'report.md');
+  await fsp.writeFile(produced, 'hello');
+
+  const persistence = {
+    list: async () => [{ header: { id: 'session-alpha', cwd } }],
+    open: async () => ({
+      read: async () => ({
+        events: [{ type: 'tool/call', data: { name: 'write', arguments: JSON.stringify({ file_path: produced }) } }],
+      }),
+      close: async () => {},
+    }),
+  };
+  const deletedTasks = [];
+  const closedTasks = new Set();
+  const schedule = {
+    catalog: async () => [
+      { id: 'schedule-alive', title: 'Aimed elsewhere', status: 'active', target: { kind: 'session', sessionId: 'session-other' } },
+      { id: 'schedule-dead', title: 'Aimed here', status: 'active', target: { kind: 'session', sessionId: 'session-alpha' } },
+      { id: 'schedule-fresh', title: 'New session', status: 'active', target: { kind: 'new' } },
+    ],
+    edit: async (request) => {
+      if (closedTasks.has(request.id)) throw new Error('already gone');
+      closedTasks.add(request.id);
+      deletedTasks.push(request);
+      return { id: request.id, deleted: true };
+    },
+  };
+
+  const handlers = createHandlers({
+    home,
+    sessions: { get: () => undefined },
+    workspaceRegistry: makeRegistry(home, ['session-alpha']).registry,
+    sessionPersistence: persistence,
+    getSchedule: () => schedule,
+  });
+
+  const listing = await handlers.state();
+  assert.equal(listing.items[0].scheduleCount, 1, 'the row advertises the dead task');
+
+  const scan = await handlers.scanAll(['session-alpha']);
+  assert.deepEqual(scan.artifacts.map((file) => file.path), [produced]);
+  assert.equal(scan.schedules.count, 1);
+
+  const result = await handlers.remove(['session-alpha'], { everything: true });
+  assert.equal(result.ok, true);
+  assert.equal(result.artifacts.deleted, 1);
+  await assert.rejects(fsp.stat(produced), 'the produced file is gone');
+  assert.deepEqual(deletedTasks.map((task) => task.id), ['schedule-dead']);
+  assert.equal(result.schedules.deleted, 1);
+  assert.equal(result.schedules.failed, 0);
+
+  // A Host without the Schedule service must still purge Sessions.
+  const bare = createHandlers({
+    home,
+    sessions: { get: () => undefined },
+    workspaceRegistry: makeRegistry(home, []).registry,
+    sessionPersistence: undefined,
+  });
+  assert.equal((await bare.state()).items.length, 0);
+});
+
 test('scanSessionDirs indexes every project directory', async () => {
   const { home } = await makeHome();
   const second = path.join(home, 'sessions', '--C-other--');

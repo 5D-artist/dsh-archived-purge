@@ -8,18 +8,18 @@ DSH 自带的「归档」只是把会话从侧边栏隐藏，磁盘上的日志�
 
 ## 功能
 
-- **一眼看清**：按工作区分组，显示标题、最后活动时间、占用体积。
-- **全选 / 多选**：顶部全选，逐行勾选，实时显示已选条数与总体积。
-- **永久删除**：一次清掉四类本地痕迹
+- **一眼看清**：顶部汇总归档会话数、占用空间、运行中数量与已选体积；按工作区分组显示标题、体积、最后活动时间与定时任务数量。
+- **全选 / 分组 / 多选**：顶部全选，组头「全选本组」，逐行勾选，实时显示已选条数与总体积。
+- **一次删干净**：确认弹窗默认勾选「彻底清理」，由 Host 从仍然可读的日志推导出整批可删资料
   - 会话日志目录 `<DSH_HOME>/sessions/--<cwd>--/<session-id>/`
   - 投影缓存行 `<DSH_HOME>/storages/session_projcache/sessions/<session-id>.json`
   - 工作区记账（公开 API `Workspace.detachSession`）
   - 全局归档集合（`workspaceRegistry.unarchiveSession`）
+  - 该批会话 `write` / `edit` / `present` 写出的工作区文件（可展开逐项取消）
+  - 删完这批后没有任何日志引用的附件对象
+  - 指向这些会话的定时任务（目标已不存在，永远不可能再投递）
 - **子代理级联**：仅删除 `origin: 'subagent'` 且挂在被删会话下的子会话日志；普通 fork 出来的会话不受影响。
-- **深度清理（可选）**：删除对话框会先扫描并勾选式列出
-  - **无人引用的附件**：删完这批会话后，`attachments/v1/objects/<sha256>` 里没有任何剩余日志引用的对象（引用感知，先读后删）；
-  - **请求图缩放缓存**：`cache/attachments/request-images/`，可重建；
-  - **该批会话写出的工作区文件**：只识别 `write` / `edit` / `present` 明确写过的路径，逐个勾选、默认不选。
+- **可重建缓存单独开关**：`cache/attachments/request-images/` 默认不动，需要时勾选清空。
 - **孤儿附件单独入口**：不删会话也能点「清理孤儿附件」，先 dry-run 报数字，再确认执行。
 - **历史残留扫描**：每次删除都会在 `<DSH_HOME>/archived-purge-manifest.json` 记下该会话产出过的文件；之后点「扫描历史残留」一次性列出
   - 已删除会话产出的、仍在磁盘上的文件（**大小与 mtime 对不上就标记「已被改动」并跳过**）；
@@ -48,8 +48,8 @@ https://github.com/5D-artist/dsh-archived-purge
 ## 使用
 
 1. 打开 **设置 → 归档清理**。
-2. 点「全选」，或逐条勾选。
-3. 点「删除所选」→ 对话框里可选择要不要一并深度清理 → 确认。
+2. 点「全选」，或用组头「全选本组」、逐条勾选。
+3. 点「删除所选」→ 确认弹窗里默认已勾选整批资料（可按需取消某一类或某个文件）→ 确认。
 
 删除不可撤销，列表不会自动清理任何东西 —— 只有确认后的选中项才会被删。
 
@@ -62,9 +62,10 @@ https://github.com/5D-artist/dsh-archived-purge
 | 工作区记账 | ✅ | 走 `Workspace.detachSession`，不手改 `workspace.json` |
 | 归档集合 | ✅ | 走 `unarchiveSession`，不手改注册表 |
 | subagent 子会话日志 | ✅ | 仅 `origin: 'subagent'` 的后代 |
-| 附件（`attachments/v1/objects/`） | ⚙️ 可选 | 只在没有其它日志引用时删除；先读日志收集引用，再删 |
-| 请求图缩放缓存（`cache/attachments/request-images/`） | ⚙️ 可选 | 派生文件，可重建 |
-| 该批会话写出的工作区文件 | ⚙️ 手动勾选 | 只列 `write` / `edit` / `present` 的路径，默认不选 |
+| 附件（`attachments/v1/objects/`） | ✅ 默认 | 只在没有其它日志引用时删除；先读日志收集引用，再删 |
+| 该批会话写出的工作区文件 | ✅ 默认（可逐项取消） | 只列 `write` / `edit` / `present` 的路径，且必须位于会话 cwd 内 |
+| 指向已删会话的定时任务 | ✅ 默认 | 通过公开 `ctx.schedule` 服务删除；目标不存在，任务不可能再触发 |
+| 请求图缩放缓存（`cache/attachments/request-images/`） | ⚙️ 可选 | 派生文件，可重建，默认不清 |
 | 已删除会话的产出文件（历史残留） | ⚙️ 手动勾选 | 来自删除时写入的 manifest；大小/mtime 变过的不动 |
 | 残留日志目录 / 投影缓存行 / 记账 / 归档标记 | ⚙️ 可选 | 「扫描历史残留」里逐类确认 |
 | 其它工作区文件（脚本产出的视频等） | ❌ | 日志里没有可信的「谁产出的」记录 |
@@ -75,7 +76,8 @@ https://github.com/5D-artist/dsh-archived-purge
 - DSH 的附件存储是**内容寻址且不可变**的，`dsh-attachment` 的文档写明：恢复或 fork 出来的会话可能共享同一批对象，因此 **reference-aware GC 被明确推迟，不绑定任何单个会话的删除**；上游现状是「附件永不删除」。
 - 会话日志里只存 `{"type":"image","attachment":{"attachmentId":"sha256:…"}}` 这类引用，**没有「谁创建了它」的字段**，所以本插件按「先读后删」实现：先读完所有剩余日志收集摘要，再删对象；删单个会话时，它独占的对象自然变成孤儿，一次清扫即可。
 - 三条安全规则：**读不全就不删**（任一日志读取失败即整次取消）、**10 分钟宽限期**（新对象可能还没写进日志）、**只删对象与派生缓存**，绝不碰日志之外的索引文件。
-- 工作区文件同理：日志只记录 `write` / `edit` / `present` 的目标路径，脚本（pwsh/ffmpeg 等）产出的文件没有归属记录，插件不会靠时间戳猜；能被证明的才逐个列出，供你勾选。
+- 工作区文件同理：日志只记录 `write` / `edit` / `present` 的目标路径，脚本（pwsh/ffmpeg 等）产出的文件没有归属记录，插件不会靠时间戳猜；能被证明的才列出，默认全选但可逐项取消。
+- 定时任务只删「投递目标就是这些会话」的行；只是在 `involvedSessionIds` 里提到过该会话的任务不动，避免误删仍然有效的提醒。
 
 ## 安全设计
 
@@ -83,7 +85,8 @@ https://github.com/5D-artist/dsh-archived-purge
 - **整批前置检查**：删除前先一次性检查这一批（含 subagent 后代），只要有一个还在跑就整批不动，不会出现「一半删了、一半留着」的残局。
 - **驻留会话的记账延后回收**：文件可以立刻删（磁盘马上回收），但**不能**在会话还驻留内存时把它从工作区记账里摘掉 —— 那样它仍会被 `sessions.list()` 列出来，只是失去归属，于是掉进侧边栏的「未分组」。所以驻留目标的记账与归档标记会保留到**下次启动**（此时进程不再持有该会话），由 `finalizePending()` 收尾；页面在此期间只显示一行「另有 N 个已删除会话的记账将在下次启动时自动回收」。
 - **附件 GC 的安全边界**：只删 `attachments/v1/objects/` 下没有任何日志引用的对象；任一日志读不出来就整次放弃；10 分钟内的新对象一律保留；`request-images` 只清派生缓存。
-- **工作区文件的安全边界**：路径必须由 Host 自己扫描得出（浏览器传什么都要重新核对），必须是该批会话日志里 `write` / `edit` / `present` 的目标，必须位于会话 cwd 内，且**永不在 `DSH_HOME`、插件自身目录、`.git` / `node_modules` 内**；默认全部不勾选，逐项确认。
+- **工作区文件的安全边界**：路径必须由 Host 自己扫描得出（浏览器传什么都要重新核对），必须是该批会话日志里 `write` / `edit` / `present` 的目标，必须位于会话 cwd 内，且**永不在 `DSH_HOME`、插件自身目录、`.git` / `node_modules` 内**；默认全选，但确认弹窗可展开逐项取消。
+- **「彻底清理」不信任浏览器**：页面只发送 `everything: true`；具体删哪些文件、哪些附件、哪些任务全部由 Host 在删除前重新推导，浏览器只能缩小范围（改发显式 `files` 列表），不能扩大。
 - **入口校验**：`sessionId` 必须匹配 `^[A-Za-z0-9][A-Za-z0-9_-]{0,199}$`；请求必须同源、`application/json`、体大小受限。
 - **路径边界**：待删路径必须 `path.relative` 落在 `sessions/` 或投影缓存根内。
 - **不重写注册表**：归档集合与工作区记账都通过公开 service 方法修改，避免与运行中的注册表写入竞争。
@@ -91,7 +94,7 @@ https://github.com/5D-artist/dsh-archived-purge
 ## 兼容性
 
 - 实测：**DSH 0.2.1-rc.5**（Desktop，Windows）。
-- 需要 Host 服务：`webServer`、`workspaceRegistry`、`sessions`、`sessionPersistence`。
+- 需要 Host 服务：`webServer`、`workspaceRegistry`、`sessions`、`sessionPersistence`；`schedule` 为可选服务（没有装 Schedule 插件时只是不清理定时任务）。
 - 存储布局：0.2.x 的 v4 会话日志、`workspace.json` schema v2、`session_projcache` 单记录文件、`attachments/v1/objects` 内容寻址对象。
 - 仅 Web 客户端（`dsh.client.platform = web`）。
 
@@ -99,9 +102,9 @@ https://github.com/5D-artist/dsh-archived-purge
 
 | 方法 | 路径 | 说明 |
 |---|---|---|
-| GET | `/plugins/archived-purge/state` | 归档列表（标题、工作区、体积、最后活动、`active` / `activity` / `resident`） |
-| POST | `/plugins/archived-purge/delete` | `{ "sessionIds": [...], "files": [...], "attachments": true, "requestImages": true }`；请求本身合法时恒返回 200，`ok` / `code` / `message` / `results` / `artifacts` / `gc` 描述结果 |
-| POST | `/plugins/archived-purge/scan` | `{ "sessionIds": [...] }` 只读预演：删掉这批会释放多少附件、请求图缓存多大、写出的工作区文件清单 |
+| GET | `/plugins/archived-purge/state` | 归档列表（标题、工作区、体积、最后活动、`active` / `activity` / `resident`，以及 `scheduleCount`） |
+| POST | `/plugins/archived-purge/delete` | `{ "sessionIds": [...], "everything": true, "files": [...], "attachments": true, "requestImages": true }`；`everything` 由 Host 推导整批资料，`files` 只能缩小范围。请求本身合法时恒返回 200，`ok` / `code` / `message` / `results` / `artifacts` / `schedules` / `gc` 描述结果 |
+| POST | `/plugins/archived-purge/scan` | `{ "sessionIds": [...] }` 只读预演：删掉这批会释放多少附件、请求图缓存多大、写出的工作区文件清单、指向它们的定时任务 |
 | POST | `/plugins/archived-purge/gc` | `{ "dryRun": true, "requestImages": false }` 孤儿附件清扫；`dryRun: false` 才真删 |
 | POST | `/plugins/archived-purge/leftovers` | 只读扫描历史残留：manifest 里的产出文件、残留日志目录/缓存行/记账/归档标记，以及孤儿附件 |
 | POST | `/plugins/archived-purge/purge-leftovers` | `{ "files": [...], "logs": true, "caches": true, "accounting": true, "archived": true, "attachments": true, "requestImages": true }` |
@@ -110,6 +113,14 @@ https://github.com/5D-artist/dsh-archived-purge
 删除接口的状态码约定：`400` 只用于请求体不是合法 JSON，`403` 只用于跨源，`405` / `415` 用于方法与 Content-Type；「没删成」属于业务结果，用 200 + `ok: false` + `message` 表达，页面据此逐条列出原因。
 
 ## 更新日志
+
+### 1.3.0
+
+- **一次点干净**：确认弹窗默认勾选整批资料，Host 新增 `everything: true` 语义 —— 在删除前按仍然可读的日志重新推导「该批会话写出的文件 + 只剩它们引用的附件」，浏览器不参与决定删什么，只能缩小范围。
+- **新增定时任务清理**：目标会话被删后永远不可能再投递的 `schedule` 任务一并删除（通过公开 `ctx.schedule` 服务，Service 缺席时静默跳过）；列表行与扫描结果都会显示任务数量。
+- **界面重做**：顶部四格汇总（归档数 / 占用 / 运行中 / 已选）、组头「全选本组」、行内体积与最后活动对齐、回合计费式「预计释放」、可展开的文件清单、移动端底部弹层；确认弹窗按类别展示清理范围，不再是一排复选框。
+- 扫描结果新增 `schedules`；失败原因逐条列出（含定时任务删除失败）。
+- 测试增至 38 项（Host 12 / 路由 10 / 清理 7 / 残留 5 / 客户端 4）。
 
 ### 1.2.0
 
@@ -141,20 +152,21 @@ https://github.com/5D-artist/dsh-archived-purge
 ## 开发
 
 ```sh
-node --test test/host.test.mjs test/http.test.mjs
+node --test test/host.test.mjs test/http.test.mjs test/clean.test.mjs test/leftovers.test.mjs test/client.test.mjs
 ```
 
-`test/host.test.mjs` 在临时目录构造完整存储结构，覆盖列表、删除、运行中拒绝、驻留但空闲（回归）、整批前置检查、非法 ID、记账已从投影消失、subagent 级联；`test/http.test.mjs` 用假的 `ctx` 驱动真实路由，锁定状态码、扫描与 GC 的响应体；`test/clean.test.mjs` 单测引用扫描、孤儿判定、只读对象删除、产出物识别；`test/client.test.mjs` 用最小 React 运行时真实挂载设置页并点击。全部不触碰真实数据。
+`test/host.test.mjs` 在临时目录构造完整存储结构，覆盖列表、删除、运行中拒绝、驻留但空闲（回归）、整批前置检查、非法 ID、记账已从投影消失、subagent 级联、`everything` 清理与定时任务删除；`test/http.test.mjs` 用假的 `ctx` 驱动真实路由，锁定状态码、扫描与 GC 的响应体；`test/clean.test.mjs` 单测引用扫描、孤儿判定、只读对象删除、产出物识别；`test/client.test.mjs` 用最小 React 运行时真实挂载设置页并点击。全部不触碰真实数据。
 
 ```
 index.js            Host 半：列表 / 删除 / 路由 / 边界校验
 lib/clean.js        引用扫描、附件 GC、产出物识别与删除
-client.js           Client 半：设置页、全选、确认弹窗、深度清理
+client.js           Client 半：设置页、全选、确认弹窗、彻底清理
 cordis.patch.yml    bundle patch
 locale/{zh,en}.json 插件市场展示元数据
 test/host.test.mjs  Host 单测
 test/http.test.mjs  路由 / 扫描 / GC 集成测试
 test/clean.test.mjs 清理模块单测
+test/leftovers.test.mjs 残留扫描单测
 test/client.test.mjs 客户端渲染与交互测试
 ```
 
@@ -164,6 +176,7 @@ test/client.test.mjs 客户端渲染与交互测试
 - **1.2.0 之前删掉的会话没有 manifest**，它们产出过的文件无法再归属，扫描不会列出；附件/缓存/记账这类结构性残留仍然能扫到。
 - 附件 GC 是**全量扫描**：会话越多、日志越大，耗时越长（本机 6 个会话/2820 条事件约几十毫秒）。
 - 10 分钟宽限期内的附件对象不会被回收。
+- 定时任务清理依赖可选的 `schedule` 服务；没有该服务时任务保持原样（页面也不会显示任务数）。
 - 驻留会话的记账在下一次启动时回收（DSH 没有让第三方插件把会话逐出 `ctx.sessions` 的公开接口）。
 - 工作区产出物只认 `write` / `edit` / `present` 的显式路径；`pwsh`/`ffmpeg` 等命令产出的文件不在清单里。
 - 归档时间不是 DSH 的持久字段，列表用最后活动时间排序。
@@ -182,13 +195,14 @@ DSH's built-in archive only hides a session from the sidebar; its log, projectio
 
 ## Features
 
-- Grouped by workspace with title, last activity and size.
-- Select all or individual rows, with live count and total size.
+- Grouped by workspace with title, size, last activity and scheduled-task count; a top summary shows archived count, disk usage, running count and the selected size.
+- Select all, a whole group, or individual rows, with a live count and total size.
 - Permanent deletion of the session log directory, the projection-cache row, the workspace accounting slot (`Workspace.detachSession`) and the archive-set entry (`workspaceRegistry.unarchiveSession`).
 - Cascades only `origin: 'subagent'` descendants; ordinary forks are left alone.
 - Guards: a Session that still reports work is refused (decided by `workspace/session-activity`, not by "it is still in memory"), ids are allow-listed, every path must stay inside the session/cache roots, POSTs are same-origin, and deletion needs an explicit confirmation.
 - Readable failures: a refused or failed delete lists each Session with its reason instead of a bare `HTTP 400`.
-- **Deep clean (optional)** in the confirmation dialog: unreferenced attachment objects, the request-image downscale cache, and the workspace files those Sessions explicitly wrote (`write` / `edit` / `present`, listed one by one and unticked by default).
+- **One-click deep clean (default)**: the confirmation dialog is pre-ticked to remove everything the Host can prove belongs to those Sessions — the workspace files their logs attributed, attachment objects no remaining log references, and scheduled tasks aimed at them. Each category can be unticked; the file list is collapsed until opened and every file can be excluded individually.
+- The request-image downscale cache is regenerable and stays opt-in.
 - **Standalone orphan sweep**: without deleting anything, dry-run first and then remove attachments no log references.
 - **Leftover scan**: every delete records what the Session had produced in `<DSH_HOME>/archived-purge-manifest.json`; "Scan leftovers" then lists the produced files still on disk (size + mtime must match, otherwise the file is marked *changed* and skipped), orphan log directories, stale projection-cache rows, dangling workspace slots and archive markers, unreferenced attachments and the request-image cache — each category opt-in, removed for good on confirm.
 
@@ -202,7 +216,7 @@ Or use **Settings → Plugins → Add plugin** with `https://github.com/5D-artis
 
 ## Usage
 
-Settings → Archive Cleanup → select all → Delete selected → confirm. Nothing is deleted before that confirmation.
+Settings → Archive Cleanup → select all → Delete selected → confirm. The dialog already covers the whole disposable set; untick a category or an individual file if something must stay. Nothing is deleted before that confirmation.
 
 ## Safety
 
@@ -210,13 +224,21 @@ Archiving hides a Session without disposing it, so a recently used archived Sess
 
 Deleting the files of a resident Session is fine; dropping its workspace slot while it is still listed is not — that is what made the Session reappear under the sidebar's *Ungrouped* bucket. So a resident target keeps its slot and archive marker until the process no longer holds it, and `finalizePending()` (on load, and before each batch) clears them on the next start. The page says how many entries are waiting.
 
-Attachments and their derived request-image cache are not deleted by default: objects are content-addressed, may be shared by resumed or forked Sessions, and upstream `dsh-attachment` deliberately defers reference-aware GC. The optional deep clean supplies that missing half by reading every remaining log first: an unreadable log aborts the sweep, objects younger than ten minutes are kept (an attachment is published before the event that references it), and only objects no log mentions are removed. Workspace files are never guessed: only the explicit targets of `write` / `edit` / `present` are offered, they must live inside the Session's cwd, and the server never accepts a path it did not itself list; `DSH_HOME`, this plugin's own package, `.git` and `node_modules` are excluded. The workspace registry is never rewritten by hand; archive and accounting go through public service methods.
+Attachments and their derived request-image cache are not deleted by default: objects are content-addressed, may be shared by resumed or forked Sessions, and upstream `dsh-attachment` deliberately defers reference-aware GC. The deep clean supplies that missing half by reading every remaining log first: an unreadable log aborts the sweep, objects younger than ten minutes are kept (an attachment is published before the event that references it), and only objects no log mentions are removed. Workspace files are never guessed: only the explicit targets of `write` / `edit` / `present` are offered, they must live inside the Session's cwd, and the server never accepts a path it did not itself list; `DSH_HOME`, this plugin's own package, `.git` and `node_modules` are excluded. `everything: true` is resolved on the Host from the still-readable logs, so the browser can only narrow the set, never widen it. Scheduled tasks are removed only when their delivery target is one of the deleted Sessions. The workspace registry is never rewritten by hand; archive and accounting go through public service methods.
 
 ## Compatibility
 
-Tested on DSH 0.2.1-rc.5 (Desktop, Windows). Requires `webServer`, `workspaceRegistry`, `sessions` and `sessionPersistence`; targets the 0.2.x v4 session layout, workspace schema v2 and the `attachments/v1/objects` store.
+Tested on DSH 0.2.1-rc.5 (Desktop, Windows). Requires `webServer`, `workspaceRegistry`, `sessions` and `sessionPersistence`; `schedule` is optional (without the Schedule plugin, tasks are simply left alone). Targets the 0.2.x v4 session layout, workspace schema v2 and the `attachments/v1/objects` store.
 
 ## Changelog
+
+### 1.3.0
+
+- **Delete everything in one click**: the confirmation dialog is pre-ticked, and the Host gains `everything: true` — it re-derives the attributed workspace files and now-orphaned attachments from the still-readable logs just before deleting. The browser can only narrow that set.
+- **Scheduled-task cleanup**: tasks whose delivery target is a deleted Session can never fire again and are removed through the public `ctx.schedule` service (silently skipped when the service is absent); rows and the scan report the task count.
+- **Redesigned page**: four summary tiles (archived / on disk / running / selected), per-group select-all, aligned size and last-activity metadata, an "frees about" estimate, a collapsible file list, and a bottom-sheet dialog on narrow screens; the confirmation dialog now reads as a scope list instead of a checkbox wall.
+- The scan response gained `schedules`; failures are listed per item, including schedule deletions.
+- 38 tests now (host 12, routes 10, cleaner 7, leftovers 5, client 4).
 
 ### 1.2.0
 

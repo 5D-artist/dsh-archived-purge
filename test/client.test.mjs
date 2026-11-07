@@ -186,7 +186,7 @@ const stateResponse = () => ({
   totalBytes: 4096,
 });
 
-test('the settings page renders, then sends the deep-clean delete body', async () => {
+test('the settings page renders, then deletes the whole derived scope by default', async () => {
   const responses = {
     '/state': stateResponse,
     '/scan': () => ({
@@ -194,6 +194,7 @@ test('the settings page renders, then sends the deep-clean delete body', async (
       attachments: { objects: 2, bytes: 200, orphanObjects: 1, orphanBytes: 100, keptObjects: 1, blocked: undefined },
       requestImages: { files: 1, bytes: 50 },
       artifacts: [{ path: 'C:\\ws\\report.md', bytes: 10, mtime: 1, tools: ['write'], sessions: ['session-a'] }],
+      schedules: { available: true, count: 1, items: [{ id: 'schedule-1', title: 'Later' }] },
       unreadableSessions: [],
     }),
     '/delete': () => ({
@@ -203,6 +204,7 @@ test('the settings page renders, then sends the deep-clean delete body', async (
       deferred: [],
       removedBytes: 4096,
       artifacts: { deleted: 1, bytes: 10, results: [] },
+      schedules: { deleted: 1, failed: 0, tasks: 1 },
       gc: { removedObjects: 1, removedBytes: 100 },
     }),
   };
@@ -223,17 +225,21 @@ test('the settings page renders, then sends the deep-clean delete body', async (
     tree = await panel.settle(tree);
     assert.ok(panel.calls.some((call) => call.url.endsWith('/scan')), 'opening the dialog scans first');
 
-    // The deep-clean block shows the attachment and artifact numbers.
+    // Every scope category is summarised; the file list starts collapsed.
     const deep = find(tree, (node) => hasClass(node, 'ap-deep'))[0];
-    assert.ok(deep, 'the deep-clean block rendered');
-    assert.match(textOf(deep), /report\.md/);
+    assert.ok(deep, 'the scope block rendered');
+    assert.match(textOf(deep), /scopeSession/);
+    assert.match(textOf(deep), /scopeFiles/);
+    assert.match(textOf(deep), /scopeAttachments/);
+    assert.match(textOf(deep), /scopeSchedules/);
+    assert.doesNotMatch(textOf(deep), /report\.md/);
 
-    // Tick the produced file, then confirm.
-    const fileRow = find(deep, (node) => hasClass(node, 'ap-file'))[0];
-    assert.ok(fileRow, 'the produced file is offered');
-    const fileBox = find(fileRow, (node) => node.props?.type === 'checkbox')[0];
-    fileBox.props.onChange();
+    const show = find(deep, (node) => node.type === 'button' && textOf(node) === 'showFiles')[0];
+    assert.ok(show, 'the file list can be opened');
+    show.props.onClick();
     tree = await panel.settle(tree);
+    assert.match(textOf(tree), /report\.md/);
+
     const confirm = find(tree, (node) => node.type === 'button' && textOf(node) === 'confirm')[0];
     assert.ok(confirm, 'the confirm button exists');
     confirm.props.onClick();
@@ -241,10 +247,54 @@ test('the settings page renders, then sends the deep-clean delete body', async (
 
     const del = panel.calls.find((call) => call.url.endsWith('/delete'));
     assert.deepEqual(del.body.sessionIds, ['session-a']);
-    assert.deepEqual(del.body.files, ['C:\\ws\\report.md']);
+    assert.equal(del.body.everything, true, 'the untouched scope asks the Host to derive everything');
+    assert.equal(del.body.files, undefined);
     assert.equal(del.body.attachments, true);
     assert.equal(del.body.requestImages, false);
     assert.match(textOf(tree), /noticeDeleted/);
+  } finally {
+    panel.restore();
+  }
+});
+
+test('unticking a produced file narrows the delete to the remaining paths', async () => {
+  const responses = {
+    '/state': stateResponse,
+    '/scan': () => ({
+      ok: true,
+      attachments: { objects: 1, bytes: 10, orphanObjects: 0, orphanBytes: 0, keptObjects: 1, blocked: undefined },
+      requestImages: { files: 0, bytes: 0 },
+      artifacts: [
+        { path: 'C:\\ws\\keep.md', bytes: 10, mtime: 1, tools: ['write'], sessions: ['session-a'] },
+        { path: 'C:\\ws\\drop.md', bytes: 20, mtime: 2, tools: ['edit'], sessions: ['session-a'] },
+      ],
+      schedules: { available: true, count: 0, items: [] },
+      unreadableSessions: [],
+    }),
+    '/delete': () => ({ ok: true, deleted: 1, failed: 0, deferred: [], removedBytes: 4096, artifacts: { deleted: 1, bytes: 10, results: [] } }),
+  };
+  const panel = await mountPanel(responses);
+  try {
+    const selectAll = find(panel.tree, (node) => node.props?.type === 'checkbox' && node.props?.['aria-label'] === 'selectAll')[0];
+    selectAll.props.onChange();
+    let tree = await panel.settle(panel.tree);
+    find(tree, (node) => node.type === 'button' && textOf(node) === 'delete')[0].props.onClick();
+    tree = await panel.settle(tree);
+    find(tree, (node) => node.type === 'button' && textOf(node) === 'showFiles')[0].props.onClick();
+    tree = await panel.settle(tree);
+
+    const rows = find(tree, (node) => hasClass(node, 'ap-file'));
+    assert.equal(rows.length, 2);
+    const drop = rows.find((row) => textOf(row).includes('drop.md'));
+    assert.ok(drop, 'each file is listed');
+    find(drop, (node) => node.props?.type === 'checkbox')[0].props.onChange();
+    tree = await panel.settle(tree);
+
+    find(tree, (node) => node.type === 'button' && textOf(node) === 'confirm')[0].props.onClick();
+    await panel.settle(tree);
+    const del = panel.calls.find((call) => call.url.endsWith('/delete'));
+    assert.equal(del.body.everything, undefined);
+    assert.deepEqual(del.body.files, ['C:\\ws\\keep.md']);
   } finally {
     panel.restore();
   }
