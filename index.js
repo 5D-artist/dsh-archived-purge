@@ -773,7 +773,11 @@ export function createHandlers(deps) {
     }
 
     let gc;
-    if (options?.everything === true || options?.attachments === true) {
+    // `everything` sweeps attachments unless the caller explicitly said no;
+    // an explicit list (`files`) leaves the attachment decision to the flag.
+    const sweepAttachments = options?.attachments === true
+      || (options?.everything === true && options?.attachments !== false);
+    if (sweepAttachments) {
       const plan = await attachmentPlan(new Set());
       if (plan.blocked) {
         gc = { blocked: plan.blocked, message: plan.message, failures: plan.failures };
@@ -1259,7 +1263,8 @@ export function apply(ctx) {
           // One switch for the whole derived set; the Host still decides what
           // is eligible, so a crafted `everything` can never reach more.
           everything: payload?.everything === true,
-          attachments: payload?.attachments === true,
+          // Tri-state: omitted means "follow `everything`", false opts out.
+          attachments: typeof payload?.attachments === 'boolean' ? payload.attachments : undefined,
           requestImages: payload?.requestImages === true,
         });
         // A well-formed request that removed nothing is a business outcome,

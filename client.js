@@ -674,7 +674,13 @@ window.__ModuleLoader__.load({
 
         const runDelete = async () => {
           const ids = [...selected];
-          const body = { sessionIds: ids, attachments: deep.attachments && orphanCount > 0, requestImages: deep.requestImages };
+          const body = {
+            sessionIds: ids,
+            // A failed scan means the attachment picture is unknown: never sweep
+            // blind, only the explicitly reviewed categories go through.
+            attachments: Boolean(scanned && deep.attachments),
+            requestImages: deep.requestImages,
+          };
           // `everything` lets the Host re-derive the set from logs that are
           // still readable instead of trusting a list the browser built.
           if (scanned && deep.files && excluded.size === 0) body.everything = true;
@@ -1058,6 +1064,7 @@ window.__ModuleLoader__.load({
                 type: 'button',
                 className: 'ap-btn ap-primary-danger',
                 onClick: runDelete,
+                disabled: scan?.loading === true || busy,
                 autoFocus: true,
               }, t('confirm')),
             ),

@@ -120,7 +120,7 @@ https://github.com/5D-artist/dsh-archived-purge
 - **新增定时任务清理**：目标会话被删后永远不可能再投递的 `schedule` 任务一并删除（通过公开 `ctx.schedule` 服务，Service 缺席时静默跳过）；列表行与扫描结果都会显示任务数量。
 - **界面重做**：顶部四格汇总（归档数 / 占用 / 运行中 / 已选）、组头「全选本组」、行内体积与最后活动对齐、回合计费式「预计释放」、可展开的文件清单、移动端底部弹层；确认弹窗按类别展示清理范围，不再是一排复选框。
 - 扫描结果新增 `schedules`；失败原因逐条列出（含定时任务删除失败）。
-- 测试增至 38 项（Host 12 / 路由 10 / 清理 7 / 残留 5 / 客户端 4）。
+- 测试增至 39 项（Host 12 / 路由 11 / 清理 7 / 残留 5 / 客户端 4）。
 
 ### 1.2.0
 
@@ -238,7 +238,7 @@ Tested on DSH 0.2.1-rc.5 (Desktop, Windows). Requires `webServer`, `workspaceReg
 - **Scheduled-task cleanup**: tasks whose delivery target is a deleted Session can never fire again and are removed through the public `ctx.schedule` service (silently skipped when the service is absent); rows and the scan report the task count.
 - **Redesigned page**: four summary tiles (archived / on disk / running / selected), per-group select-all, aligned size and last-activity metadata, an "frees about" estimate, a collapsible file list, and a bottom-sheet dialog on narrow screens; the confirmation dialog now reads as a scope list instead of a checkbox wall.
 - The scan response gained `schedules`; failures are listed per item, including schedule deletions.
-- 38 tests now (host 12, routes 10, cleaner 7, leftovers 5, client 4).
+- 39 tests now (host 12, routes 11, cleaner 7, leftovers 5, client 4).
 
 ### 1.2.0
 

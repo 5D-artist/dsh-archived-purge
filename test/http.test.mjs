@@ -442,3 +442,26 @@ test('the everything switch deletes every attributed file and nothing else', asy
   await assert.rejects(fsp.stat(produced));
   assert.ok((await fsp.stat(sibling)).isFile(), 'a file the log never attributed survives');
 });
+
+test('everything sweeps orphan attachments by default and an explicit false opts out', async () => {
+  for (const optOut of [false, true]) {
+    const { home } = await makeHome();
+    process.env.DSH_HOME = home;
+    const objectsRoot = path.join(home, 'attachments', 'v1', 'objects');
+    const orphan = await writeObject(objectsRoot, digest('e'), 64);
+    const persistence = fakePersistence({}, home);
+    const { ctx, routes } = makeCtx(home, () => [], { persistence });
+    apply(ctx);
+
+    const extra = optOut ? { attachments: false } : {};
+    const del = await callDelete(routes, ['session-alpha'], { everything: true, ...extra });
+    assert.equal(del.payload.ok, true);
+    if (optOut) {
+      assert.ok((await fsp.stat(orphan)).isFile(), 'an explicit false keeps the sweep out');
+      assert.equal(del.payload.gc, undefined);
+    } else {
+      await assert.rejects(fsp.stat(orphan), 'the default everything sweep removes the orphan');
+      assert.equal(del.payload.gc.removedObjects, 1);
+    }
+  }
+});
