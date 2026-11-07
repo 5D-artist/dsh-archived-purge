@@ -41,11 +41,19 @@ function makeCtx(home, activity, options = {}) {
   const routes = new Map();
   const detached = [];
   const unarchived = [];
-  async function rewrite(change) {
-    const file = path.join(home, 'storages', 'workspace.json');
-    const doc = JSON.parse(await fsp.readFile(file, 'utf8'));
-    change(doc);
-    await fsp.writeFile(file, JSON.stringify(doc, null, 2));
+  // Serialize + write atomically, like the real registry's operation queue: the
+  // plugin's startup finalize and a route can both rewrite this file.
+  let chain = Promise.resolve();
+  function rewrite(change) {
+    chain = chain.then(async () => {
+      const file = path.join(home, 'storages', 'workspace.json');
+      const doc = JSON.parse(await fsp.readFile(file, 'utf8'));
+      change(doc);
+      const temporary = `${file}.${Math.random().toString(16).slice(2)}.tmp`;
+      await fsp.writeFile(temporary, JSON.stringify(doc, null, 2));
+      await fsp.rename(temporary, file);
+    });
+    return chain;
   }
   const ctx = {
     sessions: { get: (id) => (id === 'session-alpha' ? { id } : undefined) },
@@ -271,6 +279,42 @@ test('malformed JSON stays a 400 while a rejected id travels as data', async () 
   assert.equal(bad.status, 200);
   assert.equal(bad.payload.ok, false);
   assert.equal(bad.payload.code, 'invalid-request');
+});
+
+test('leftover scan reports stale index entries and purges them', async () => {
+  const { home } = await makeHome();
+  process.env.DSH_HOME = home;
+  const { ctx, routes } = makeCtx(home, () => []);
+  apply(ctx);
+  // Let the plugin's own start-up finalize settle before planting the ghosts,
+  // otherwise it would clean them up before the test looks at them.
+  await new Promise((resolve) => setImmediate(resolve));
+
+  const registryFile = path.join(home, 'storages', 'workspace.json');
+  const doc = JSON.parse(await fsp.readFile(registryFile, 'utf8'));
+  doc.tables.workspaces.w1.sessionIds.push('session-ghost');
+  doc.global.archivedSessionIds.push('session-ghost');
+  await fsp.writeFile(registryFile, JSON.stringify(doc, null, 2));
+  const cacheFile = path.join(home, 'storages', 'session_projcache', 'sessions', 'session-ghost.json');
+  await fsp.writeFile(cacheFile, JSON.stringify({ record: { rows: {} } }));
+
+  const scan = await post(routes, '/plugins/archived-purge/leftovers', {});
+  assert.equal(scan.status, 200);
+  assert.equal(scan.payload.caches.length, 1);
+  assert.equal(scan.payload.accounting.length, 1);
+  assert.equal(scan.payload.archived.length, 1);
+
+  const purged = await post(routes, '/plugins/archived-purge/purge-leftovers', {
+    caches: true,
+    accounting: true,
+    archived: true,
+  });
+  assert.equal(purged.status, 200, JSON.stringify(purged.payload));
+  assert.equal(purged.payload.ok, true);
+  await assert.rejects(fsp.stat(cacheFile));
+  const after = JSON.parse(await fsp.readFile(registryFile, 'utf8'));
+  assert.ok(!after.tables.workspaces.w1.sessionIds.includes('session-ghost'));
+  assert.ok(!after.global.archivedSessionIds.includes('session-ghost'));
 });
 
 test('scan reports what a delete would free, gc removes only unreferenced objects', async () => {

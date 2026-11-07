@@ -71,6 +71,22 @@ window.__ModuleLoader__.load({
       noticeFiles: '文件 {n} 个 {size}',
       noticeAttachments: '附件 {n} 个 {size}',
       noticeCache: '图缓存 {size}',
+      leftovers: '扫描历史残留',
+      leftoversTitle: '历史残留',
+      leftoversScanning: '正在扫描残留…',
+      leftoversEmpty: '没有发现残留',
+      leftoverFiles: '已删除会话产出的文件',
+      leftoverLogs: '残留日志目录',
+      leftoverCaches: '残留投影缓存行',
+      leftoverAccounting: '失效的工作区记账',
+      leftoverArchived: '失效的归档标记',
+      leftoverAttachments: '无人引用的附件',
+      leftoverCache: '请求图缓存',
+      leftoverChanged: '（{n} 个已被改动，跳过）',
+      leftoverFilesNote: '共 {n} 个，已选 {m} 个',
+      leftoverPurge: '永久删除所选',
+      leftoverDone: '已清理残留：释放 {size}',
+      leftoverCount: '{n} 项',
       irreversible: '此操作不可撤销',
       countUnit: '个会话',
     };
@@ -130,6 +146,22 @@ window.__ModuleLoader__.load({
       noticeFiles: '{n} files {size}',
       noticeAttachments: '{n} attachments {size}',
       noticeCache: 'image cache {size}',
+      leftovers: 'Scan leftovers',
+      leftoversTitle: 'Leftovers',
+      leftoversScanning: 'Scanning leftovers…',
+      leftoversEmpty: 'No leftovers found',
+      leftoverFiles: 'Files produced by deleted Sessions',
+      leftoverLogs: 'Orphan log directories',
+      leftoverCaches: 'Orphan projection-cache rows',
+      leftoverAccounting: 'Dangling workspace slots',
+      leftoverArchived: 'Dangling archive markers',
+      leftoverAttachments: 'Unreferenced attachments',
+      leftoverCache: 'Request-image cache',
+      leftoverChanged: ' ({n} changed since, skipped)',
+      leftoverFilesNote: '{n} found, {m} selected',
+      leftoverPurge: 'Delete selected permanently',
+      leftoverDone: 'Leftovers cleared: freed {size}',
+      leftoverCount: '{n} items',
       irreversible: 'This action cannot be undone',
       countUnit: 'sessions',
     };
@@ -255,6 +287,8 @@ window.__ModuleLoader__.load({
         const [scan, setScan] = useState(null);
         const [deep, setDeep] = useState({ attachments: true, requestImages: false, files: new Set() });
         const [gc, setGc] = useState(null);
+        const [leftovers, setLeftovers] = useState(null);
+        const [leftoverSel, setLeftoverSel] = useState(null);
         const masterRef = useRef(null);
 
         const load = useCallback(async () => {
@@ -414,6 +448,95 @@ window.__ModuleLoader__.load({
           }
         };
 
+        const scanLeftovers = async () => {
+          setNotice(null);
+          setGc(null);
+          setLeftovers({ busy: true, plan: null });
+          setLeftoverSel(null);
+          try {
+            const plan = await request('/leftovers', {
+              method: 'POST',
+              headers: { 'content-type': 'application/json' },
+              body: '{}',
+            });
+            const selectable = plan.files.filter((file) => !file.changed).map((file) => file.path);
+            const empty = plan.files.length === 0
+              && plan.logs.length === 0
+              && plan.caches.length === 0
+              && plan.accounting.length === 0
+              && plan.archived.length === 0
+              && (plan.attachments?.orphanObjects ?? 0) === 0
+              && (plan.requestImages?.files ?? 0) === 0;
+            if (empty) {
+              setLeftovers(null);
+              setLeftoverSel(null);
+              setNotice({ kind: 'ok', text: t('leftoversEmpty') });
+              return;
+            }
+            setLeftovers({ busy: false, plan });
+            setLeftoverSel({
+              files: new Set(selectable),
+              logs: plan.logs.length > 0,
+              caches: plan.caches.length > 0,
+              accounting: plan.accounting.length > 0,
+              archived: plan.archived.length > 0,
+              attachments: (plan.attachments?.orphanObjects ?? 0) > 0,
+              requestImages: (plan.requestImages?.files ?? 0) > 0,
+            });
+          } catch (cause) {
+            setLeftovers(null);
+            setLeftoverSel(null);
+            setNotice({ kind: 'error', text: `${t('deleteFailed')}：${cause?.payload?.message || cause?.message || ''}` });
+          }
+        };
+
+        const toggleLeftoverFile = (filePath) => {
+          setLeftoverSel((current) => {
+            if (!current) return current;
+            const files = new Set(current.files);
+            if (files.has(filePath)) files.delete(filePath);
+            else files.add(filePath);
+            return { ...current, files };
+          });
+        };
+
+        const setLeftoverFlag = (key, value) => {
+          setLeftoverSel((current) => (current ? { ...current, [key]: value } : current));
+        };
+
+        const runLeftoverPurge = async () => {
+          if (!leftoverSel) return;
+          setLeftovers((current) => ({ busy: true, plan: current?.plan ?? null }));
+          try {
+            const result = await request('/purge-leftovers', {
+              method: 'POST',
+              headers: { 'content-type': 'application/json' },
+              body: JSON.stringify({
+                files: [...leftoverSel.files],
+                logs: leftoverSel.logs,
+                caches: leftoverSel.caches,
+                accounting: leftoverSel.accounting,
+                archived: leftoverSel.archived,
+                attachments: leftoverSel.attachments,
+                requestImages: leftoverSel.requestImages,
+              }),
+            });
+            setNotice({
+              kind: result?.ok === false ? 'error' : 'ok',
+              text: result?.ok === false
+                ? `${t('deleteFailed')}：${result?.message || ''}`
+                : t('leftoverDone').replace('{size}', formatBytes(result?.bytes ?? 0)),
+            });
+            setLeftovers(null);
+            setLeftoverSel(null);
+            await load();
+          } catch (cause) {
+            setLeftovers(null);
+            setLeftoverSel(null);
+            setNotice({ kind: 'error', text: `${t('deleteFailed')}：${cause?.payload?.message || cause?.message || ''}` });
+          }
+        };
+
         useEffect(() => {
           if (!confirming) return undefined;
           const onKey = (event) => {
@@ -513,6 +636,32 @@ window.__ModuleLoader__.load({
           'aria-label': label,
         });
 
+        const leftoverPlan = leftovers?.plan ?? null;
+        const leftoverChanged = leftoverPlan ? leftoverPlan.files.filter((file) => file.changed).length : 0;
+        const leftoverFree = (() => {
+          if (!leftoverPlan || !leftoverSel) return 0;
+          let total = 0;
+          for (const file of leftoverPlan.files) {
+            if (!file.changed && leftoverSel.files.has(file.path)) total += file.bytes;
+          }
+          if (leftoverSel.logs) total += leftoverPlan.logs.reduce((sum, entry) => sum + (entry.bytes ?? 0), 0);
+          if (leftoverSel.caches) total += leftoverPlan.caches.reduce((sum, entry) => sum + (entry.bytes ?? 0), 0);
+          if (leftoverSel.attachments) total += leftoverPlan.attachments?.orphanBytes ?? 0;
+          if (leftoverSel.requestImages) total += leftoverPlan.requestImages?.bytes ?? 0;
+          return total;
+        })();
+
+        const leftoverRow = (key, label, count, bytes) => h('label', { className: 'ap-deeprow', key },
+          h('input', {
+            type: 'checkbox',
+            checked: Boolean(leftoverSel?.[key]),
+            disabled: count === 0,
+            onChange: (event) => setLeftoverFlag(key, event.target.checked),
+          }),
+          h('span', null, label),
+          h('span', { className: 'ap-meta' }, count === 0 ? '—' : `${count}${bytes ? ` · ${formatBytes(bytes)}` : ''}`),
+        );
+
         return h('div', { className: 'ap-root' },
           h('style', null, CSS),
           h('div', { className: 'ap-head' },
@@ -535,6 +684,12 @@ window.__ModuleLoader__.load({
               `${t('selected')} ${selectedCount} / ${total}${selectedCount > 0 ? ` · ${formatBytes(selectedBytes)}` : ''}`,
             ),
             h('span', { className: 'ap-spacer' }),
+            h('button', {
+              type: 'button',
+              className: 'ap-btn',
+              onClick: scanLeftovers,
+              disabled: loading || busy || leftovers?.busy === true,
+            }, t('leftovers')),
             h('button', {
               type: 'button',
               className: 'ap-btn',
@@ -577,6 +732,51 @@ window.__ModuleLoader__.load({
                 : null,
             )
             : null,
+          leftovers?.busy
+            ? h('div', { className: 'ap-notice' }, t('leftoversScanning'))
+            : leftoverPlan && leftoverSel
+              ? h('div', { className: 'ap-notice ap-deep' },
+                h('div', { className: 'ap-deeptitle' }, t('leftoversTitle')),
+                leftoverRow('files', t('leftoverFiles'), leftoverPlan.files.length,
+                  leftoverPlan.files.filter((file) => !file.changed).reduce((sum, file) => sum + file.bytes, 0)),
+                leftoverChanged > 0
+                  ? h('div', { className: 'ap-meta' }, t('leftoverChanged').replace('{n}', String(leftoverChanged)))
+                  : null,
+                leftoverPlan.files.length > 0
+                  ? h('div', { className: 'ap-filelist' },
+                    leftoverPlan.files.slice(0, 60).map((file) => h('label', { className: 'ap-file', key: file.path },
+                      h('input', {
+                        type: 'checkbox',
+                        checked: leftoverSel.files.has(file.path),
+                        disabled: file.changed,
+                        onChange: () => toggleLeftoverFile(file.path),
+                      }),
+                      h('span', { className: 'ap-filename', title: file.path }, file.path),
+                      h('span', { className: 'ap-meta' }, file.changed ? t('leftoverChanged').replace('{n}', '1') : formatBytes(file.bytes)),
+                    )),
+                  )
+                  : null,
+                leftoverRow('logs', t('leftoverLogs'), leftoverPlan.logs.length,
+                  leftoverPlan.logs.reduce((sum, entry) => sum + (entry.bytes ?? 0), 0)),
+                leftoverRow('caches', t('leftoverCaches'), leftoverPlan.caches.length,
+                  leftoverPlan.caches.reduce((sum, entry) => sum + (entry.bytes ?? 0), 0)),
+                leftoverRow('accounting', t('leftoverAccounting'), leftoverPlan.accounting.length, 0),
+                leftoverRow('archived', t('leftoverArchived'), leftoverPlan.archived.length, 0),
+                leftoverRow('attachments', t('leftoverAttachments'), leftoverPlan.attachments?.orphanObjects ?? 0,
+                  leftoverPlan.attachments?.orphanBytes ?? 0),
+                leftoverRow('requestImages', t('leftoverCache'), leftoverPlan.requestImages?.files ?? 0,
+                  leftoverPlan.requestImages?.bytes ?? 0),
+                h('div', { className: 'ap-actions' },
+                  h('span', { className: 'ap-meta ap-spacer' }, `${t('noticeFreed')} ${formatBytes(leftoverFree)}`),
+                  h('button', {
+                    type: 'button',
+                    className: 'ap-btn',
+                    onClick: () => { setLeftovers(null); setLeftoverSel(null); },
+                  }, t('cancel')),
+                  h('button', { type: 'button', className: 'ap-btn ap-primary-danger', onClick: runLeftoverPurge }, t('leftoverPurge')),
+                ),
+              )
+              : null,
           (data?.pendingFinalize ?? 0) > 0
             ? h('div', { className: 'ap-meta' }, t('pendingFinalizeHint').replace('{n}', String(data.pendingFinalize)))
             : null,

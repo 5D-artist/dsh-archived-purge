@@ -1,6 +1,6 @@
 {
   "name": "dsh-archived-purge",
-  "version": "1.1.0",
+  "version": "1.2.0",
   "type": "module",
   "description": "Select-all cleanup for archived DeepSeek Harness sessions: permanently delete the session log, projection cache, workspace accounting and archive marker together.",
   "keywords": [
@@ -26,7 +26,7 @@
     "dsh": ">=0.2.1-rc.0"
   },
   "scripts": {
-    "test": "node --test test/host.test.mjs test/http.test.mjs test/clean.test.mjs test/client.test.mjs"
+    "test": "node --test test/host.test.mjs test/http.test.mjs test/clean.test.mjs test/leftovers.test.mjs test/client.test.mjs"
   },
   "exports": {
     ".": "./index.js",

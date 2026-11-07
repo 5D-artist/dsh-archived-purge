@@ -32,11 +32,15 @@ import os from 'node:os';
 import {
   collectAttachmentReferences,
   deleteArtifactFiles,
+  fileStampMatches,
   pickOrphans,
   pruneEmptyDirs,
+  readManifest,
+  recordDeletions,
   removeFiles,
   scanSessionArtifacts,
   walkFiles,
+  writeManifest,
 } from './lib/clean.js';
 
 export const name = 'archived-purge';
@@ -310,13 +314,14 @@ export function createHandlers(deps) {
 
   /** Workspace files the given Sessions explicitly wrote or presented. */
   async function artifactScan(ids) {
-    const map = await cwdBySession();
-    return scanSessionArtifacts({
+    const cwds = await cwdBySession();
+    const scanned = await scanSessionArtifacts({
       sessionPersistence,
       sessionIds: ids,
       home,
-      workspacesBySession: map,
+      workspacesBySession: cwds,
     });
+    return { ...scanned, cwds };
   }
 
   async function state() {
@@ -619,12 +624,17 @@ export function createHandlers(deps) {
       };
     }
 
-    // Deep clean needs the artifact list while the logs are still readable: the
-    // allowed set is derived here, never taken from the request.
-    let artifactFiles = [];
-    if (Array.isArray(options?.files) && options.files.length > 0) {
-      const scanned = await artifactScan(ids);
-      artifactFiles = scanned.files;
+    // The artifact list is needed for two things: the files the caller ticked,
+    // and the manifest a later leftover scan reads once the log is gone. Both
+    // must be derived here, while the log is still readable; the request never
+    // decides what is allowed.
+    const scannedArtifacts = await artifactScan([...ids, ...childIds]);
+    const artifactFiles = scannedArtifacts.files;
+    const artifactCwd = scannedArtifacts.cwds ?? new Map();
+    const titles = new Map();
+    for (const id of ids) {
+      const cacheDoc = await readCacheDoc(cacheRoot, id);
+      if (cacheDoc) titles.set(id, titleOfCache(cacheDoc));
     }
 
     const results = [];
@@ -638,13 +648,31 @@ export function createHandlers(deps) {
     }
 
     let artifacts;
-    if (artifactFiles.length > 0) {
+    if (Array.isArray(options?.files) && options.files.length > 0) {
       // Only files owned by Sessions that really went away stay on the table.
       const gone = new Set(results.filter((item) => item.ok).map((item) => item.id));
       const allowed = artifactFiles.filter((file) => file.sessions.some((id) => gone.has(id)));
       if (allowed.length > 0) {
         artifacts = await deleteArtifactFiles({ files: allowed, requested: options.files, home });
       }
+    }
+
+    // Record what the removed Sessions had produced, so a later scan can still
+    // find those files once their logs (and their attribution) are gone.
+    try {
+      const gone = new Set(results.filter((item) => item.ok).map((item) => item.id));
+      const records = [...gone].map((id) => ({
+        id,
+        title: titles.get(id) ?? '',
+        at: Date.now(),
+        root: artifactCwd.get(id) ?? null,
+        files: artifactFiles
+          .filter((file) => file.sessions.includes(id))
+          .map((file) => ({ path: file.path, bytes: file.bytes, mtime: file.mtime, root: file.root })),
+      }));
+      await recordDeletions(home, records);
+    } catch {
+      /* the manifest only feeds the leftover report; a failure must not fail the delete */
     }
 
     let gc;
@@ -774,7 +802,228 @@ export function createHandlers(deps) {
     };
   }
 
-  return { state, remove, finalizePending, collectGarbage, scanAll, sessionsRoot, cacheRoot };
+  /**
+   * What already-removed Sessions can still leave on disk: the files they
+   * produced (from the deletion manifest), a log directory or projection-cache
+   * row for an id that no longer exists, a dangling workspace slot or archive
+   * marker, plus the reference-aware attachment picture.
+   * @returns {Promise<object>} a read-only report; nothing is removed here.
+   */
+  async function leftoverScan() {
+    const manifest = await readManifest(home);
+    const dirs = await scanSessionDirs(sessionsRoot);
+    const { archived, workspaces } = await readArchivedState(home);
+    const listed = new Set();
+    if (sessionPersistence && typeof sessionPersistence.list === 'function') {
+      try {
+        for (const snapshot of await sessionPersistence.list()) {
+          const id = snapshot?.header?.id;
+          if (typeof id === 'string') listed.add(id);
+        }
+      } catch {
+        /* an unreadable listing simply widens nothing: every check below still needs a definite miss */
+      }
+    }
+    const gone = (id) => !listed.has(id) && !isResident(id) && (dirs.get(id) ?? []).length === 0;
+    // A directory nobody can list is residue too, but only while it is not a
+    // readable stored Session — that one is real and must survive.
+    const orphanDir = (id) => !listed.has(id) && !isResident(id) && (dirs.get(id) ?? []).length > 0;
+
+    const files = [];
+    const logs = [];
+    const caches = [];
+    for (const record of manifest.deleted) {
+      for (const entry of record.files ?? []) {
+        if (typeof entry?.path !== 'string' || !path.isAbsolute(entry.path)) continue;
+        let stat;
+        try {
+          stat = await fsp.lstat(entry.path);
+        } catch {
+          continue;
+        }
+        if (!stat.isFile() || stat.isSymbolicLink()) continue;
+        if (isInside(home, entry.path) || (record.root && !isInside(record.root, entry.path))) continue;
+        if (entry.root && path.resolve(entry.path) === path.resolve(entry.root)) continue;
+        files.push({
+          path: entry.path,
+          bytes: stat.size,
+          mtime: stat.mtimeMs,
+          recordedBytes: entry.bytes,
+          sessionId: record.id,
+          title: record.title ?? '',
+          at: record.at ?? null,
+          changed: !fileStampMatches(entry, stat),
+        });
+      }
+      if (orphanDir(record.id)) {
+        for (const dir of dirs.get(record.id) ?? []) {
+          if (!isInside(sessionsRoot, dir)) continue;
+          const stats = await dirStats(dir);
+          logs.push({ path: dir, sessionId: record.id, bytes: stats.bytes });
+        }
+      }
+    }
+
+    // Structural leftovers: an id that no stored Session, live Session or log
+    // directory owns can only be a stale index entry.
+    let cacheEntries = [];
+    try {
+      cacheEntries = await fsp.readdir(cacheRoot, { withFileTypes: true });
+    } catch {
+      cacheEntries = [];
+    }
+    for (const entry of cacheEntries) {
+      if (!entry.isFile() || !entry.name.endsWith('.json')) continue;
+      const id = entry.name.slice(0, -'.json'.length);
+      if (!gone(id)) continue;
+      const file = path.join(cacheRoot, entry.name);
+      let bytes = 0;
+      try {
+        bytes = (await fsp.stat(file)).size;
+      } catch {
+        continue;
+      }
+      caches.push({ path: file, sessionId: id, bytes });
+    }
+    const accounting = [];
+    for (const [workspaceId, record] of Object.entries(workspaces)) {
+      if (!record || !Array.isArray(record.sessionIds)) continue;
+      for (const id of record.sessionIds) if (gone(id)) accounting.push({ workspaceId, sessionId: id });
+    }
+    const archivedLeft = archived.filter((id) => gone(id)).map((id) => ({ id }));
+
+    const attachments = await attachmentPlan(new Set());
+    const images = await requestImagesPlan();
+    const totalBytes = files.reduce((sum, file) => sum + (file.changed ? 0 : file.bytes), 0)
+      + (attachments.orphanBytes ?? 0)
+      + images.bytes;
+
+    return {
+      ok: true,
+      files,
+      logs,
+      caches,
+      accounting,
+      archived: archivedLeft,
+      attachments: {
+        objects: attachments.objects.length,
+        bytes: attachments.totalBytes,
+        orphanObjects: attachments.orphanObjects ?? null,
+        orphanBytes: attachments.orphanBytes ?? null,
+        blocked: attachments.blocked,
+        failures: attachments.failures,
+      },
+      requestImages: { files: images.files.length, bytes: images.bytes },
+      manifestRecords: manifest.deleted.length,
+      totalBytes,
+    };
+  }
+
+  /**
+   * Remove the leftovers the caller selected, re-derived on the server so a
+   * crafted request cannot reach anything the scan did not offer.
+   * @param {object} options - `files` plus one boolean per category.
+   * @returns {Promise<object>} per-category outcomes.
+   */
+  async function purgeLeftovers(options = {}) {
+    const plan = await leftoverScan();
+    const result = { ok: true, bytes: 0, files: undefined, logs: [], caches: [], accounting: [], archived: [], gc: undefined };
+
+    if (Array.isArray(options.files) && options.files.length > 0) {
+      const allowed = plan.files.filter((file) => !file.changed);
+      result.files = await deleteArtifactFiles({ files: allowed, requested: options.files, home });
+      result.bytes += result.files.bytes;
+      // Drop what is gone so the next report does not list it again.
+      try {
+        const doc = await readManifest(home);
+        const kept = [];
+        for (const record of doc.deleted) {
+          const files = [];
+          for (const entry of record.files ?? []) {
+            try {
+              await fsp.access(entry.path);
+              files.push(entry);
+            } catch {
+              /* removed */
+            }
+          }
+          kept.push({ ...record, files });
+        }
+        await writeManifest(home, { ...doc, deleted: kept });
+      } catch {
+        /* the manifest is self-healing on the next delete */
+      }
+    }
+
+    if (options.logs === true) {
+      for (const entry of plan.logs) {
+        try {
+          await removeTree(entry.path);
+          result.logs.push(entry.path);
+          result.bytes += entry.bytes ?? 0;
+        } catch (error) {
+          result.ok = false;
+          result.logs.push({ path: entry.path, error: formatError(error) });
+        }
+      }
+    }
+
+    if (options.caches === true) {
+      for (const entry of plan.caches) {
+        try {
+          await fsp.rm(entry.path, { force: true });
+          result.caches.push(entry.path);
+          result.bytes += entry.bytes ?? 0;
+        } catch (error) {
+          result.ok = false;
+          result.caches.push({ path: entry.path, error: formatError(error) });
+        }
+      }
+    }
+
+    if (options.accounting === true) {
+      for (const entry of plan.accounting) {
+        const owner = wsEntity(entry.workspaceId);
+        if (!owner) continue;
+        try {
+          await owner.detachSession(entry.sessionId);
+          result.accounting.push(entry);
+        } catch (error) {
+          result.ok = false;
+        }
+      }
+    }
+
+    if (options.archived === true) {
+      for (const entry of plan.archived) {
+        try {
+          await workspaceRegistry.unarchiveSession(entry.id);
+          result.archived.push(entry.id);
+        } catch {
+          result.ok = false;
+        }
+      }
+    }
+
+    if (options.attachments === true) {
+      const sweep = await collectGarbage({ dryRun: false, requestImages: false });
+      result.gc = sweep;
+      result.bytes += sweep.removedBytes ?? 0;
+      if (!sweep.ok) result.ok = false;
+    }
+    if (options.requestImages === true) {
+      const images = await requestImagesPlan();
+      const cleared = await removeFiles(images.files);
+      await pruneEmptyDirs(requestImagesRoot);
+      result.gc = { ...(result.gc ?? {}), requestImages: { removedFiles: cleared.removed, bytes: cleared.bytes, failures: cleared.failures } };
+      result.bytes += cleared.bytes;
+      if (cleared.failures.length > 0) result.ok = false;
+    }
+
+    return { ...result, plan: { files: plan.files.length, logs: plan.logs.length, caches: plan.caches.length } };
+  }
+
+  return { state, remove, finalizePending, collectGarbage, scanAll, leftoverScan, purgeLeftovers, sessionsRoot, cacheRoot };
 }
 
 function readBody(req) {
@@ -968,6 +1217,66 @@ export function apply(ctx) {
         // `dryRun` must be explicitly false to delete anything.
         send(res, 200, await handlers.collectGarbage({
           dryRun: payload?.dryRun !== false,
+          requestImages: payload?.requestImages === true,
+        }));
+      } catch (error) {
+        send(res, 500, { ok: false, code: 'internal', message: formatError(error) });
+      }
+    },
+  }));
+
+  ctx.effect(() => ctx.webServer.register({
+    kind: 'exact',
+    path: `${ROUTE}/leftovers`,
+    async handler(req, res) {
+      if (req.method !== 'POST') {
+        send(res, 405, { ok: false, code: 'method-not-allowed' });
+        return;
+      }
+      if (!sameOrigin(req)) {
+        send(res, 403, { ok: false, code: 'foreign-origin' });
+        return;
+      }
+      try {
+        send(res, 200, await handlers.leftoverScan());
+      } catch (error) {
+        send(res, 500, { ok: false, code: 'internal', message: formatError(error) });
+      }
+    },
+  }));
+
+  ctx.effect(() => ctx.webServer.register({
+    kind: 'exact',
+    path: `${ROUTE}/purge-leftovers`,
+    async handler(req, res) {
+      if (req.method !== 'POST') {
+        send(res, 405, { ok: false, code: 'method-not-allowed' });
+        return;
+      }
+      if (!sameOrigin(req)) {
+        send(res, 403, { ok: false, code: 'foreign-origin' });
+        return;
+      }
+      const type = String(req.headers['content-type'] ?? '');
+      if (!type.includes('application/json')) {
+        send(res, 415, { ok: false, code: 'content-type-required' });
+        return;
+      }
+      let payload;
+      try {
+        payload = JSON.parse(await readBody(req));
+      } catch (error) {
+        send(res, 400, { ok: false, code: 'invalid-json', message: formatError(error) });
+        return;
+      }
+      try {
+        send(res, 200, await handlers.purgeLeftovers({
+          files: Array.isArray(payload?.files) ? payload.files : [],
+          logs: payload?.logs === true,
+          caches: payload?.caches === true,
+          accounting: payload?.accounting === true,
+          archived: payload?.archived === true,
+          attachments: payload?.attachments === true,
           requestImages: payload?.requestImages === true,
         }));
       } catch (error) {

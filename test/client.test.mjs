@@ -250,6 +250,61 @@ test('the settings page renders, then sends the deep-clean delete body', async (
   }
 });
 
+test('the leftover scan renders its categories and purges the selection', async () => {
+  let purged = null;
+  const responses = {
+    '/state': stateResponse,
+    '/leftovers': () => ({
+      ok: true,
+      files: [{
+        path: 'C:\\ws\\old.md',
+        bytes: 12,
+        mtime: 1,
+        changed: false,
+        sessionId: 'session-gone',
+        title: 'Gone',
+        at: 1,
+      }],
+      logs: [{ path: 'C:\\home\\sessions\\--x--\\session-gone', bytes: 40 }],
+      caches: [{ path: 'C:\\home\\caches\\session-gone.json', bytes: 8 }],
+      accounting: [],
+      archived: [],
+      attachments: { objects: 3, bytes: 300, orphanObjects: 2, orphanBytes: 200 },
+      requestImages: { files: 1, bytes: 50 },
+      totalBytes: 310,
+      manifestRecords: 1,
+    }),
+    '/purge-leftovers': (body) => {
+      purged = body;
+      return { ok: true, bytes: 310, files: { deleted: 1, bytes: 12 }, logs: [], caches: [] };
+    },
+  };
+  const panel = await mountPanel(responses);
+  try {
+    const button = find(panel.tree, (node) => node.type === 'button' && textOf(node) === 'leftovers')[0];
+    assert.ok(button, 'the leftover scan button exists');
+    button.props.onClick();
+    let tree = await panel.settle(panel.tree);
+    assert.match(textOf(tree), /leftoversTitle/);
+    assert.match(textOf(tree), /old\.md/);
+
+    const confirm = find(tree, (node) => node.type === 'button' && textOf(node) === 'leftoverPurge')[0];
+    assert.ok(confirm, 'the purge button rendered');
+    confirm.props.onClick();
+    tree = await panel.settle(tree);
+
+    assert.deepEqual(purged.files, ['C:\\ws\\old.md']);
+    assert.equal(purged.logs, true);
+    assert.equal(purged.caches, true);
+    assert.equal(purged.accounting, false);
+    assert.equal(purged.attachments, true);
+    assert.equal(purged.requestImages, true);
+    assert.match(textOf(tree), /leftoverDone/);
+  } finally {
+    panel.restore();
+  }
+});
+
 test('the orphan-attachment sweep asks before deleting anything', async () => {
   let executed = false;
   const responses = {

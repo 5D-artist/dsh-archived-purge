@@ -21,6 +21,13 @@ DSH 自带的「归档」只是把会话从侧边栏隐藏，磁盘上的日志�
   - **请求图缩放缓存**：`cache/attachments/request-images/`，可重建；
   - **该批会话写出的工作区文件**：只识别 `write` / `edit` / `present` 明确写过的路径，逐个勾选、默认不选。
 - **孤儿附件单独入口**：不删会话也能点「清理孤儿附件」，先 dry-run 报数字，再确认执行。
+- **历史残留扫描**：每次删除都会在 `<DSH_HOME>/archived-purge-manifest.json` 记下该会话产出过的文件；之后点「扫描历史残留」一次性列出
+  - 已删除会话产出的、仍在磁盘上的文件（**大小与 mtime 对不上就标记「已被改动」并跳过**）；
+  - 残留日志目录（记账里已经没有、也读不出来的会话目录）；
+  - 残留投影缓存行、失效的工作区记账、失效的归档标记；
+  - 无人引用的附件与请求图缓存；
+  
+  逐类勾选后一次永久删除，已经不存在的东西不会重复列出。
 - **安全护栏**：仍在运行工作的会话拒绝删除（按 `workspace/session-activity` 判定，不是「在内存里就算运行中」）；`sessionId` 白名单正则；删除路径必须落在 `sessions/` 与投影缓存根内；POST 校验同源；删除前二次确认并显示条数与体积。
 - **失败可读**：被拒绝或失败时逐条列出会话与原因，不再只弹一句 `HTTP 400`。
 
@@ -58,6 +65,8 @@ https://github.com/5D-artist/dsh-archived-purge
 | 附件（`attachments/v1/objects/`） | ⚙️ 可选 | 只在没有其它日志引用时删除；先读日志收集引用，再删 |
 | 请求图缩放缓存（`cache/attachments/request-images/`） | ⚙️ 可选 | 派生文件，可重建 |
 | 该批会话写出的工作区文件 | ⚙️ 手动勾选 | 只列 `write` / `edit` / `present` 的路径，默认不选 |
+| 已删除会话的产出文件（历史残留） | ⚙️ 手动勾选 | 来自删除时写入的 manifest；大小/mtime 变过的不动 |
+| 残留日志目录 / 投影缓存行 / 记账 / 归档标记 | ⚙️ 可选 | 「扫描历史残留」里逐类确认 |
 | 其它工作区文件（脚本产出的视频等） | ❌ | 日志里没有可信的「谁产出的」记录 |
 | fork 出来的普通会话 | ❌ | 只按 subagent 血缘级联 |
 
@@ -94,11 +103,20 @@ https://github.com/5D-artist/dsh-archived-purge
 | POST | `/plugins/archived-purge/delete` | `{ "sessionIds": [...], "files": [...], "attachments": true, "requestImages": true }`；请求本身合法时恒返回 200，`ok` / `code` / `message` / `results` / `artifacts` / `gc` 描述结果 |
 | POST | `/plugins/archived-purge/scan` | `{ "sessionIds": [...] }` 只读预演：删掉这批会释放多少附件、请求图缓存多大、写出的工作区文件清单 |
 | POST | `/plugins/archived-purge/gc` | `{ "dryRun": true, "requestImages": false }` 孤儿附件清扫；`dryRun: false` 才真删 |
+| POST | `/plugins/archived-purge/leftovers` | 只读扫描历史残留：manifest 里的产出文件、残留日志目录/缓存行/记账/归档标记，以及孤儿附件 |
+| POST | `/plugins/archived-purge/purge-leftovers` | `{ "files": [...], "logs": true, "caches": true, "accounting": true, "archived": true, "attachments": true, "requestImages": true }` |
 | POST | `/plugins/archived-purge/client-error` | 客户端挂载失败上报，写入 `<DSH_HOME>/archived-purge-client-errors.log` |
 
 删除接口的状态码约定：`400` 只用于请求体不是合法 JSON，`403` 只用于跨源，`405` / `415` 用于方法与 Content-Type；「没删成」属于业务结果，用 200 + `ok: false` + `message` 表达，页面据此逐条列出原因。
 
 ## 更新日志
+
+### 1.2.0
+
+- 新增**历史残留扫描**（`/leftovers`、`/purge-leftovers`，页面按钮「扫描历史残留」）：一次列出已删除会话产出的文件、残留日志目录、残留投影缓存行、失效的工作区记账、失效的归档标记、孤儿附件与请求图缓存，逐类勾选后永久删除。
+- 删除时写入 `archived-purge-manifest.json`（记录 id / 标题 / cwd / 产出文件的大小与 mtime），这样日志没了之后仍能找回「这个会话产出过什么」；文件被改动过就标记并跳过，绝不误删。
+- 残留判定都要求「确定不在」：既不在持久化列表、也不是活会话、也没有日志目录；残留日志目录只针对 manifest 里记录过、且已读不出来的 id。
+- 测试增至 35 项（Host 11 / 路由 9 / 清理 7 / 残留 5 / 客户端 3）。
 
 ### 1.1.0
 
@@ -143,6 +161,7 @@ test/client.test.mjs 客户端渲染与交互测试
 ## 已知限制
 
 - 只能删除归档集合中的会话；活动会话请先归档。
+- **1.2.0 之前删掉的会话没有 manifest**，它们产出过的文件无法再归属，扫描不会列出；附件/缓存/记账这类结构性残留仍然能扫到。
 - 附件 GC 是**全量扫描**：会话越多、日志越大，耗时越长（本机 6 个会话/2820 条事件约几十毫秒）。
 - 10 分钟宽限期内的附件对象不会被回收。
 - 驻留会话的记账在下一次启动时回收（DSH 没有让第三方插件把会话逐出 `ctx.sessions` 的公开接口）。
@@ -171,6 +190,7 @@ DSH's built-in archive only hides a session from the sidebar; its log, projectio
 - Readable failures: a refused or failed delete lists each Session with its reason instead of a bare `HTTP 400`.
 - **Deep clean (optional)** in the confirmation dialog: unreferenced attachment objects, the request-image downscale cache, and the workspace files those Sessions explicitly wrote (`write` / `edit` / `present`, listed one by one and unticked by default).
 - **Standalone orphan sweep**: without deleting anything, dry-run first and then remove attachments no log references.
+- **Leftover scan**: every delete records what the Session had produced in `<DSH_HOME>/archived-purge-manifest.json`; "Scan leftovers" then lists the produced files still on disk (size + mtime must match, otherwise the file is marked *changed* and skipped), orphan log directories, stale projection-cache rows, dangling workspace slots and archive markers, unreferenced attachments and the request-image cache — each category opt-in, removed for good on confirm.
 
 ## Install
 
@@ -197,6 +217,13 @@ Attachments and their derived request-image cache are not deleted by default: ob
 Tested on DSH 0.2.1-rc.5 (Desktop, Windows). Requires `webServer`, `workspaceRegistry`, `sessions` and `sessionPersistence`; targets the 0.2.x v4 session layout, workspace schema v2 and the `attachments/v1/objects` store.
 
 ## Changelog
+
+### 1.2.0
+
+- Added the **leftover scan** (`/leftovers`, `/purge-leftovers`, the "Scan leftovers" button): produced files of removed Sessions, orphan log directories, stale projection-cache rows, dangling workspace slots and archive markers, unreferenced attachments and the request-image cache — selected per category and deleted for good.
+- A delete now writes `archived-purge-manifest.json` (id, title, cwd, and each produced file's size and mtime), so those files stay findable after the log is gone; a file whose size or mtime changed is flagged and never deleted.
+- Every leftover check requires a definite miss: not in the persistence listing, not a live Session, no log directory; orphan log directories are only considered for ids the manifest recorded.
+- 35 tests now (host 11, routes 9, cleaner 7, leftovers 5, client 3).
 
 ### 1.1.0
 
